@@ -22,7 +22,7 @@ $engineering-controller execute <PROMPT_OR_SPEC>
 Run the deterministic controller from the directory where the user invoked the skill, preserving that directory as the PROJECT TARGET context:
 
 ```text
-python <SKILL_ROOT>/scripts/controller.py execute <PROMPT_OR_SPEC>
+python -X utf8 <SKILL_ROOT>/scripts/controller.py execute <PROMPT_OR_SPEC>
 ```
 
 `<SKILL_ROOT>` is the directory containing this `SKILL.md`.
@@ -46,7 +46,7 @@ $engineering-controller resume <human resolution note>
 Run:
 
 ```text
-python <SKILL_ROOT>/scripts/controller.py resume [human resolution note]
+python -X utf8 <SKILL_ROOT>/scripts/controller.py resume [human resolution note]
 ```
 
 Do not invent a human approval note. Forward only what the user actually supplied.
@@ -66,16 +66,7 @@ When `HUMAN_REQUIRED`, stop the automated loop. Do not work around the gate in t
 
 ## Non-negotiable safety
 
-Never add or suggest:
-
-- `--dangerously-bypass-approvals-and-sandbox`;
-- `--yolo`;
-- automatic force push;
-- automatic destructive reset/clean;
-- automatic branch deletion;
-- automatic merge.
-
-The v0.1 Controller does not auto-commit or auto-push.
+The v0.1 Controller does not auto-commit, auto-push, auto-merge, discard work, or bypass sandbox/approval protections. When a protected operation is required, stop at `HUMAN_REQUIRED`.
 
 ## Progressive disclosure
 

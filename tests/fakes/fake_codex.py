@@ -157,10 +157,20 @@ def main() -> int:
     command_event = None
     if scenario == "command_violation":
         command_event = "git commit -am synthetic"
+    elif scenario == "project_command_violation":
+        command_event = "synthetic-custom-forbidden --apply"
 
     if scenario == "secret_change":
         (project_root / ".env").write_text("TOKEN=synthetic-not-a-real-secret\n", encoding="utf-8")
         payload = worker_completed()
+    elif scenario == "policy_change":
+        (project_root / ".engineering-controller-policy.json").write_text("{}\n", encoding="utf-8")
+        payload = worker_completed()
+    elif scenario == "completed_failed_check":
+        (project_root / "result.txt").write_text("synthetic result\n", encoding="utf-8")
+        payload = worker_completed()
+        payload["checks"][0]["status"] = "FAIL"
+        payload["checks"][0]["detail"] = "Synthetic check deliberately failed."
     elif scenario == "human_command":
         payload = human_gate()
     elif scenario == "gate_loop":

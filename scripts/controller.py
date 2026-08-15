@@ -23,7 +23,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
-from typing import Any, Iterable, Sequence
+from typing import Any, Callable, Iterable, Sequence
 
 
 VERSION = "0.1.0"
@@ -201,14 +201,49 @@ class StateStore:
             raise ValidationError("Saved run directory does not exist.")
         return run_dir
 
+    def read_lock(self) -> dict[str, Any] | None:
+        if not self.lock_path.exists():
+            return None
+        raw = load_json_file(self.lock_path)
+        if not isinstance(raw, dict):
+            raise ValidationError("Engineering-controller lock file is corrupt.")
+        return raw
+
+    def lock_is_active(self) -> bool:
+        lock = self.read_lock()
+        if lock is None:
+            return False
+        pid = lock.get("pid")
+        if not isinstance(pid, int) or pid < 1:
+            raise ValidationError("Engineering-controller lock file has an invalid pid.")
+        return process_is_alive(pid)
+
+    def clear_stale_lock(self) -> bool:
+        lock = self.read_lock()
+        if lock is None:
+            return False
+        pid = lock.get("pid")
+        if not isinstance(pid, int) or pid < 1:
+            raise ValidationError("Engineering-controller lock file has an invalid pid.")
+        if process_is_alive(pid):
+            return False
+        self.lock_path.unlink(missing_ok=True)
+        return True
+
     def acquire_lock(self, run_id: str) -> None:
         self.repo_dir.mkdir(parents=True, exist_ok=True)
+        if self.lock_path.exists():
+            if self.lock_is_active():
+                raise HumanRequired(
+                    f"Another engineering-controller run is still active for this project: {self.lock_path}"
+                )
+            self.clear_stale_lock()
         payload = json.dumps({"pid": os.getpid(), "run_id": run_id, "started_at": utc_now()})
         try:
             fd = os.open(str(self.lock_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         except FileExistsError as exc:
             raise HumanRequired(
-                f"Another or interrupted engineering-controller run is locked for this project: {self.lock_path}"
+                f"Another engineering-controller run acquired the project lock concurrently: {self.lock_path}"
             ) from exc
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             handle.write(payload)
@@ -229,11 +264,13 @@ class CodexRunner:
         project_root: Path,
         run_dir: Path,
         project_forbidden_commands: Sequence[str] = (),
+        worker_process_callback: Callable[[int | None], None] | None = None,
     ):
         self.config = config
         self.project_root = project_root
         self.run_dir = run_dir
         self.project_forbidden_commands = tuple(project_forbidden_commands)
+        self.worker_process_callback = worker_process_callback
 
     def worker_initial(self, prompt: str) -> tuple[dict[str, Any], str, list[str]]:
         output_path = self.run_dir / "worker-output.json"
@@ -245,7 +282,7 @@ class CodexRunner:
             str(output_path),
             "-",
         ]
-        result = self._run_codex(cmd, prompt, self.config.worker_timeout, "Worker")
+        result = self._run_codex(cmd, prompt, self.config.worker_timeout, "Worker", worker_process=True)
         ensure_codex_success(result, "Worker")
         events = parse_jsonl(result.stdout)
         violations = find_forbidden_command_events(events, self.project_forbidden_commands)
@@ -269,7 +306,7 @@ class CodexRunner:
             session_id,
             "-",
         ]
-        result = self._run_codex(cmd, prompt, self.config.worker_timeout, "Worker resume")
+        result = self._run_codex(cmd, prompt, self.config.worker_timeout, "Worker resume", worker_process=True)
         ensure_codex_success(result, "Worker resume")
         events = parse_jsonl(result.stdout)
         violations = find_forbidden_command_events(events, self.project_forbidden_commands)
@@ -301,15 +338,24 @@ class CodexRunner:
         return payload, violations
 
     def _run_codex(
-        self, args: Sequence[str], prompt: str, timeout: int, label: str
+        self,
+        args: Sequence[str],
+        prompt: str,
+        timeout: int,
+        label: str,
+        worker_process: bool = False,
     ) -> ExecResult:
         before_hash = codex_user_config_hash()
         result: ExecResult | None = None
         run_error: BaseException | None = None
+        callback = self.worker_process_callback if worker_process else None
         try:
-            result = run_process(args, self.project_root, prompt, timeout)
+            result = run_process(args, self.project_root, prompt, timeout, on_start=callback)
         except BaseException as exc:
             run_error = exc
+        finally:
+            if callback is not None:
+                callback(None)
         after_hash = codex_user_config_hash()
         if before_hash != after_hash:
             raise HumanRequired(f"Codex user config changed during {label} execution.")
@@ -443,7 +489,7 @@ def validate_json_schema(value: Any, schema: dict[str, Any], path: str = "$") ->
             except ValidationError as exc:
                 errors.append(exc)
         else:
-            detail = f"anyOf matched 0 branches"
+            detail = "anyOf matched 0 branches"
             if errors:
                 detail += f"; last error: {errors[-1]}"
             raise _schema_error(path, detail)
@@ -583,9 +629,7 @@ def _validate_worker_semantics(payload: dict[str, Any]) -> None:
     if status == "COMPLETED":
         if gate is not None or failure is not None:
             raise ProtocolError("Worker COMPLETED result must have gate=null and failure=null.")
-        failed_checks = [
-            check.get("name", "unnamed") for check in checks if check.get("status") == "FAIL"
-        ]
+        failed_checks = [check.get("name", "unnamed") for check in checks if check.get("status") == "FAIL"]
         if failed_checks:
             raise ProtocolError(
                 "Worker returned COMPLETED with failed checks: " + ", ".join(str(name) for name in failed_checks)
@@ -656,6 +700,38 @@ def build_runtime_config() -> RuntimeConfig:
     )
 
 
+def process_is_alive(pid: int) -> bool:
+    if not isinstance(pid, int) or pid < 1:
+        return False
+    if pid == os.getpid():
+        return True
+    if os.name == "nt":
+        import ctypes
+
+        process_query_limited_information = 0x1000
+        still_active = 259
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        handle = kernel32.OpenProcess(process_query_limited_information, False, pid)
+        if not handle:
+            return ctypes.get_last_error() == 5
+        try:
+            exit_code = ctypes.c_ulong()
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+                return True
+            return exit_code.value == still_active
+        finally:
+            kernel32.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
 def terminate_process_tree(proc: subprocess.Popen[str]) -> None:
     if proc.poll() is not None:
         return
@@ -683,7 +759,13 @@ def terminate_process_tree(proc: subprocess.Popen[str]) -> None:
         pass
 
 
-def run_process(args: Sequence[str], cwd: Path, input_text: str | None, timeout: int) -> ExecResult:
+def run_process(
+    args: Sequence[str],
+    cwd: Path,
+    input_text: str | None,
+    timeout: int,
+    on_start: Callable[[int], None] | None = None,
+) -> ExecResult:
     creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) if os.name == "nt" else 0
     try:
         proc = subprocess.Popen(
@@ -701,6 +783,13 @@ def run_process(args: Sequence[str], cwd: Path, input_text: str | None, timeout:
     except OSError as exc:
         raise ProcessError(f"Unable to start process {Path(args[0]).name}: {exc}") from exc
 
+    if on_start is not None:
+        try:
+            on_start(proc.pid)
+        except BaseException:
+            terminate_process_tree(proc)
+            raise
+
     try:
         stdout, stderr = proc.communicate(input=input_text, timeout=timeout)
         return ExecResult(tuple(args), proc.returncode, stdout or "", stderr or "", False)
@@ -717,9 +806,7 @@ def ensure_codex_success(result: ExecResult, label: str) -> None:
         raise ProcessError(f"{label} timed out.")
     if result.returncode != 0:
         detail = truncate_tail(safe_text(result.stderr.strip()), 1200)
-        raise ProcessError(
-            f"{label} exited with code {result.returncode}{': ' + detail if detail else '.'}"
-        )
+        raise ProcessError(f"{label} exited with code {result.returncode}{': ' + detail if detail else '.'}")
 
 
 def parse_jsonl(text: str) -> list[dict[str, Any]]:
@@ -945,6 +1032,15 @@ def resolve_prompt_path(root: Path, cwd: Path, raw: str) -> Path:
     return ensure_path_inside(root, candidate)
 
 
+def same_repo_path(root: Path, relative_path: str, absolute_path: Path) -> bool:
+    candidate = root / Path(relative_path.replace("/", os.sep))
+    return normalized_path_key(candidate) == normalized_path_key(absolute_path)
+
+
+def changes_excluding_input(root: Path, changed_files: Sequence[str], prompt_path: Path) -> tuple[str, ...]:
+    return tuple(path for path in changed_files if not same_repo_path(root, path, prompt_path))
+
+
 def file_sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -1025,16 +1121,30 @@ def command_guard_from_gate(gate: dict[str, Any], policy: Policy) -> str | None:
     return forbidden_command_reason(proposed, policy.forbidden_commands) if isinstance(proposed, str) else None
 
 
+def assert_prompt_unchanged(root: Path, state: dict[str, Any]) -> None:
+    prompt_path = ensure_path_inside(root, Path(state["prompt_path"]))
+    if not prompt_path.is_file():
+        raise HumanRequired("Governing prompt/SPEC was removed during the run; input files are immutable.")
+    if file_sha256(prompt_path) != state["prompt_hash"]:
+        raise HumanRequired("Governing prompt/SPEC changed during the run; input files are immutable.")
+
+
 def check_snapshot_invariants(snapshot: GitSnapshot, state: dict[str, Any], policy: Policy) -> None:
     if snapshot.branch != state["branch"]:
         raise HumanRequired(f"Git branch changed from {state['branch']} to {snapshot.branch}.")
     if snapshot.head != state["initial_head"]:
         raise HumanRequired("Git HEAD changed during the run; v0.1 does not allow automatic commits or history changes.")
+    assert_prompt_unchanged(snapshot.root, state)
     assert_no_protected_changes(snapshot.changed_files, policy)
 
 
-def build_worker_initial_prompt(root: Path, prompt_path: Path, policy: Policy) -> str:
-    original = load_text(prompt_path)
+def build_worker_initial_prompt(
+    root: Path,
+    prompt_path: Path,
+    policy: Policy,
+    prompt_content: str | None = None,
+) -> str:
+    original = prompt_content if prompt_content is not None else load_text(prompt_path)
     relative_prompt = prompt_path.relative_to(root).as_posix()
     return f"""ENGINEERING-CONTROLLER WORKER RUN
 
@@ -1054,7 +1164,7 @@ GOVERNING PROMPT/SPEC PATH: {relative_prompt}
 {original}
 === END GOVERNING PROJECT PROMPT/SPEC ===
 
-Implement and validate the requested task inside the authorized PROJECT TARGET. Continue autonomously while inside scope and policy. Finish with only the JSON object required by the Worker schema.
+Implement and validate the requested task inside the authorized PROJECT TARGET. The governing prompt/SPEC is immutable input: do not modify, delete, rename, or overwrite it. Continue autonomously while inside scope and policy. Finish with only the JSON object required by the Worker schema.
 """
 
 
@@ -1094,7 +1204,7 @@ PROJECT RESTRICTIONS:
 WORKER GATE JSON:
 {json.dumps(gate, ensure_ascii=False, indent=2)}
 
-Review only this gate. Read the governing prompt/SPEC or evidence-referenced files only as needed. Do not modify anything. Finish with only the JSON object required by the Reviewer schema.
+Review only this gate. The governing prompt/SPEC is immutable Controller input and must not be treated as a Worker delivery. Read it or evidence-referenced files only as needed. Do not modify anything. Finish with only the JSON object required by the Reviewer schema.
 """
 
 
@@ -1110,7 +1220,7 @@ Reviewer instructions: {decision['instructions']}
 Current Git diff stat:
 {snapshot.diff_stat}
 
-Continue the same Worker task. Apply only the approved/revised direction. Global safety policy remains unchanged. APPROVE never authorizes a globally prohibited action. Finish again with only the Worker-schema JSON object.
+Continue the same Worker task. Apply only the approved/revised direction. Global safety policy remains unchanged. APPROVE never authorizes a globally prohibited action. Do not modify the governing prompt/SPEC. Finish again with only the Worker-schema JSON object.
 """
 
 
@@ -1119,7 +1229,7 @@ def build_human_resume_followup(state: dict[str, Any], snapshot: GitSnapshot, no
     note_text = note.strip() if note else "(no explicit human note supplied; re-evaluate whether repository state resolves the gate)"
     return f"""ENGINEERING-CONTROLLER HUMAN RESUME
 
-The previous automated run stopped at HUMAN_REQUIRED.
+The previous automated run stopped at HUMAN_REQUIRED or was recovered from a stale WORKER state.
 Previous gate type: {gate.get('type', '(unknown)')}
 Previous gate key: {gate.get('key', '(unknown)')}
 Human note: {note_text}
@@ -1127,7 +1237,7 @@ Human note: {note_text}
 Current Git diff stat:
 {snapshot.diff_stat}
 
-Re-evaluate the PROJECT TARGET and continue only if the human action/note genuinely resolves the gate within the governing prompt/SPEC and safety policy. A resume is never authorization for globally prohibited operations. If a material decision remains unresolved, return GATE_REQUIRED again. Finish with only the Worker-schema JSON object.
+Preserve existing workspace changes and inspect them before making further edits. Do not overwrite an existing delivery silently. Re-evaluate the PROJECT TARGET and continue only if the prior work and human action/note genuinely allow safe continuation within the governing prompt/SPEC and safety policy. A resume is never authorization for globally prohibited operations. Do not modify the governing prompt/SPEC. If a material decision remains unresolved, return GATE_REQUIRED again. Finish with only the Worker-schema JSON object.
 """
 
 
@@ -1169,18 +1279,25 @@ def record_human_required(
 ) -> None:
     state["status"] = "HUMAN_REQUIRED"
     state["human_required_reason"] = safe_text(reason)
+    resumable = isinstance(state.get("worker_session_id"), str) and bool(state.get("worker_session_id"))
+    state["resume_available"] = resumable
     if snapshot is not None:
         state["workspace_fingerprint_at_human"] = snapshot.workspace_fingerprint
     save_state(run_dir, state)
-    logger.write(f"HUMAN_REQUIRED reason={reason}")
+    logger.write(f"HUMAN_REQUIRED reason={reason} resumable={resumable}")
     ec_print("HUMAN_REQUIRED")
     print(f"Motivo: {safe_text(reason)}", flush=True)
     print(f"Estado salvo: {run_dir / 'state.json'}", flush=True)
+    if resumable:
+        print("Recuperação: resume disponível para esta execução.", flush=True)
+    else:
+        print("Recuperação: este run não possui sessão Worker resumível; não use resume para este run.", flush=True)
 
 
 def record_failed(state: dict[str, Any], run_dir: Path, logger: RunLogger, reason: str) -> None:
     state["status"] = "FAILED"
     state["failure_reason"] = safe_text(reason)
+    state["resume_available"] = False
     save_state(run_dir, state)
     logger.write(f"FAILED reason={reason}")
     ec_print(f"FAILED — {reason}")
@@ -1236,8 +1353,9 @@ def process_worker_result(
             save_state(run_dir, state)
             final_snapshot = final_validation(root, state, policy)
             state["status"] = "COMPLETED"
-            state["final_changed_files"] = list(final_snapshot.changed_files)
+            state["final_changed_files"] = list(changes_excluding_input(root, final_snapshot.changed_files, prompt_path))
             state["completed_at"] = utc_now()
+            state["resume_available"] = False
             save_state(run_dir, state)
             logger.write("Final validation OK; COMPLETED")
             ec_print("Final validation OK")
@@ -1371,10 +1489,17 @@ def execute_command(prompt_arg: str, cwd: Path) -> int:
     if prompt_guard:
         raise HumanRequired(f"Prompt/SPEC path is protected: {prompt_relative} ({prompt_guard}).")
 
+    prompt_hash = file_sha256(prompt_path)
+    prompt_content = load_text(prompt_path)
+    if file_sha256(prompt_path) != prompt_hash:
+        raise HumanRequired("Prompt/SPEC changed while Controller was capturing the input; run execute again.")
+
     snapshot = git_snapshot(root)
-    if snapshot.changed_files:
+    blocking_changes = changes_excluding_input(root, snapshot.changed_files, prompt_path)
+    if blocking_changes:
         raise HumanRequired(
-            "Working tree is not clean before Worker start: " + ", ".join(snapshot.changed_files[:20])
+            "Working tree has changes other than the governing Prompt/SPEC before Worker start: "
+            + ", ".join(blocking_changes[:20])
         )
 
     store = StateStore(config.state_home, root)
@@ -1387,10 +1512,12 @@ def execute_command(prompt_arg: str, cwd: Path) -> int:
         "status": "PREFLIGHT",
         "project_root": str(root),
         "prompt_path": str(prompt_path),
-        "prompt_hash": file_sha256(prompt_path),
+        "prompt_hash": prompt_hash,
+        "prompt_relative": prompt_relative,
         "branch": snapshot.branch,
         "initial_head": snapshot.head,
         "worker_session_id": None,
+        "active_worker_pid": None,
         "worker_runs": 0,
         "review_count": 0,
         "gate_counts": {},
@@ -1399,7 +1526,12 @@ def execute_command(prompt_arg: str, cwd: Path) -> int:
         "started_at": utc_now(),
         "updated_at": utc_now(),
         "warnings": [],
+        "resume_available": False,
     }
+
+    def worker_process_callback(pid: int | None) -> None:
+        state["active_worker_pid"] = pid
+        save_state(run_dir, state)
 
     try:
         store.acquire_lock(run_id)
@@ -1413,9 +1545,15 @@ def execute_command(prompt_arg: str, cwd: Path) -> int:
         state["status"] = "WORKER"
         save_state(run_dir, state)
 
-        runner = CodexRunner(config, root, run_dir, policy.forbidden_commands)
+        runner = CodexRunner(
+            config,
+            root,
+            run_dir,
+            policy.forbidden_commands,
+            worker_process_callback=worker_process_callback,
+        )
         worker_result, thread_id, command_violations = runner.worker_initial(
-            build_worker_initial_prompt(root, prompt_path, policy)
+            build_worker_initial_prompt(root, prompt_path, policy, prompt_content)
         )
         state["worker_session_id"] = thread_id
         save_state(run_dir, state)
@@ -1459,10 +1597,35 @@ def resume_command(note: str | None, cwd: Path) -> int:
     state = load_state(run_dir)
     logger = RunLogger(run_dir / "run.log")
 
-    if state.get("status") != "HUMAN_REQUIRED":
-        raise ValidationError(f"Current run is {state.get('status')}, not HUMAN_REQUIRED; nothing to resume.")
     if normalized_path_key(Path(state["project_root"])) != normalized_path_key(root):
         raise ValidationError("Saved state belongs to a different PROJECT TARGET.")
+
+    status = state.get("status")
+    stale_worker_recovery = False
+    if status == "WORKER":
+        lock = store.read_lock()
+        controller_active = False
+        if lock is not None:
+            lock_pid = lock.get("pid")
+            if not isinstance(lock_pid, int) or lock_pid < 1:
+                raise ValidationError("Engineering-controller lock file has an invalid pid.")
+            controller_active = process_is_alive(lock_pid)
+        worker_pid = state.get("active_worker_pid")
+        worker_active = isinstance(worker_pid, int) and worker_pid > 0 and process_is_alive(worker_pid)
+        if controller_active or worker_active:
+            active_parts: list[str] = []
+            if controller_active and lock is not None:
+                active_parts.append(f"controller pid {lock.get('pid')}")
+            if worker_active:
+                active_parts.append(f"Worker pid {worker_pid}")
+            raise ValidationError(
+                "Current run is WORKER and still active ("
+                + ", ".join(active_parts)
+                + "). Do not start another Worker; wait for the active execution to finish."
+            )
+        stale_worker_recovery = True
+    elif status != "HUMAN_REQUIRED":
+        raise ValidationError(f"Current run is {status}, not HUMAN_REQUIRED or stale WORKER; nothing to resume.")
 
     prompt_path = Path(state["prompt_path"])
     if not prompt_path.is_file():
@@ -1475,18 +1638,53 @@ def resume_command(note: str | None, cwd: Path) -> int:
     snapshot = git_snapshot(root)
     check_snapshot_invariants(snapshot, state, policy)
     session_id = state.get("worker_session_id")
+
+    if stale_worker_recovery and (not isinstance(session_id, str) or not session_id):
+        try:
+            store.acquire_lock(state["run_id"])
+            state["active_worker_pid"] = None
+            reason = (
+                "Recovered a stale WORKER run, but no Worker session ID was persisted. Existing workspace changes were "
+                "preserved and will not be overwritten. Inspect/reconcile the existing delivery, then start a new execute "
+                "only after the working tree is intentionally resolved."
+            )
+            record_failed(state, run_dir, logger, reason)
+            return 1
+        finally:
+            store.release_lock()
+
     if not isinstance(session_id, str) or not session_id:
         raise ValidationError(
-            "Saved HUMAN_REQUIRED state has no Worker session. Resolve the preflight issue and run execute again."
+            "Saved HUMAN_REQUIRED state has no Worker session. This run is not resumable; resolve the issue and run execute again."
         )
+
+    def worker_process_callback(pid: int | None) -> None:
+        state["active_worker_pid"] = pid
+        save_state(run_dir, state)
 
     try:
         store.acquire_lock(state["run_id"])
-        logger.write("RESUME requested")
+        if stale_worker_recovery:
+            state["status"] = "HUMAN_REQUIRED"
+            state["human_required_reason"] = "Recovered stale WORKER state after confirming no controller/Worker process is active."
+            state["resume_available"] = True
+            state["active_worker_pid"] = None
+            save_state(run_dir, state)
+            logger.write("STALE_WORKER recovered; resuming saved Worker session")
+            ec_print("Recovered stale WORKER; saved Worker session will be resumed")
+        else:
+            logger.write("RESUME requested")
         ec_print(f"Resume: {state['run_id']}")
         ec_print(f"Worker #{state['worker_runs'] + 1} retomado")
-        runner = CodexRunner(config, root, run_dir, policy.forbidden_commands)
+        runner = CodexRunner(
+            config,
+            root,
+            run_dir,
+            policy.forbidden_commands,
+            worker_process_callback=worker_process_callback,
+        )
         state["status"] = "WORKER"
+        state["resume_available"] = False
         save_state(run_dir, state)
         worker_result, command_violations = runner.worker_resume(
             session_id, build_human_resume_followup(state, snapshot, note)
@@ -1530,7 +1728,7 @@ def build_parser() -> argparse.ArgumentParser:
     execute_parser = subparsers.add_parser("execute", help="Start a new Engineering Loop.")
     execute_parser.add_argument("prompt", help="Prompt/SPEC file inside the PROJECT TARGET.")
 
-    resume_parser = subparsers.add_parser("resume", help="Resume the current HUMAN_REQUIRED run.")
+    resume_parser = subparsers.add_parser("resume", help="Resume the current HUMAN_REQUIRED or stale WORKER run.")
     resume_parser.add_argument("note", nargs="*", help="Optional human resolution note for the resumed Worker.")
     return parser
 
@@ -1547,6 +1745,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     except HumanRequired as exc:
         ec_print("HUMAN_REQUIRED")
         print(f"Motivo: {safe_text(str(exc))}", flush=True)
+        if args.command == "execute":
+            print("Nenhum run resumível foi criado neste preflight. Resolva a condição e execute o mesmo comando execute novamente.", flush=True)
         return 2
     except ControllerError as exc:
         ec_print(f"FAILED — {exc.category}: {exc}")

@@ -2,7 +2,8 @@
 """engineering-controller v0.1.
 
 Deterministic orchestration for a Codex Worker/Reviewer engineering loop.
-Uses only the Python standard library and external Git/Codex CLIs.
+The core is intentionally project-agnostic and uses only the Python standard
+library plus the external Git and Codex CLIs.
 """
 
 from __future__ import annotations
@@ -61,8 +62,6 @@ GLOBAL_HUMAN_FLAGS = frozenset(
     }
 )
 
-# These patterns are intentionally generic. They protect controller invariants,
-# not any particular programming language, product, database, or domain.
 GLOBAL_FORBIDDEN_COMMAND_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("sandbox bypass", re.compile(r"--dangerously-bypass-approvals-and-sandbox|--yolo", re.I)),
     ("git force push", re.compile(r"\bgit\s+push\b[^\r\n]*(?:--force(?:-with-lease)?|-f(?:\s|$))", re.I)),
@@ -91,11 +90,12 @@ SECRET_FILENAMES = frozenset(
     }
 )
 SECRET_SUFFIXES = frozenset({".pem", ".p12", ".pfx", ".key"})
+_LOG_SECRET_RE = re.compile(
+    r"(?i)\b(token|password|passwd|secret|api[_-]?key)\b(\s*[:=]\s*)([^\s,;]+)"
+)
 
 
 class ControllerError(RuntimeError):
-    """Base class for controlled failures."""
-
     category = "FAILED"
 
 
@@ -160,18 +160,16 @@ class RunLogger:
         self.path.parent.mkdir(parents=True, exist_ok=True)
 
     def write(self, message: str) -> None:
-        stamp = utc_now()
-        safe = message.replace("\r", " ").replace("\n", " ")
+        safe = safe_text(message).replace("\r", " ").replace("\n", " ")
         with self.path.open("a", encoding="utf-8") as handle:
-            handle.write(f"{stamp} {safe}\n")
+            handle.write(f"{utc_now()} {safe}\n")
 
 
 class StateStore:
     def __init__(self, state_home: Path, project_root: Path):
-        self.state_home = state_home
         self.project_root = project_root.resolve()
-        self.repo_hash = hashlib.sha256(normalized_path_key(self.project_root).encode("utf-8")).hexdigest()[:20]
-        self.repo_dir = state_home / "runs" / self.repo_hash
+        repo_hash = hashlib.sha256(normalized_path_key(self.project_root).encode("utf-8")).hexdigest()[:20]
+        self.repo_dir = state_home / "runs" / repo_hash
         self.current_path = self.repo_dir / "current.json"
         self.lock_path = self.repo_dir / ".lock"
         self._lock_held = False
@@ -198,7 +196,7 @@ class StateStore:
 
     def acquire_lock(self, run_id: str) -> None:
         self.repo_dir.mkdir(parents=True, exist_ok=True)
-        payload = json.dumps({"pid": os.getpid(), "run_id": run_id, "started_at": utc_now()}, ensure_ascii=False)
+        payload = json.dumps({"pid": os.getpid(), "run_id": run_id, "started_at": utc_now()})
         try:
             fd = os.open(str(self.lock_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         except FileExistsError as exc:
@@ -218,10 +216,17 @@ class StateStore:
 
 
 class CodexRunner:
-    def __init__(self, config: RuntimeConfig, project_root: Path, run_dir: Path):
+    def __init__(
+        self,
+        config: RuntimeConfig,
+        project_root: Path,
+        run_dir: Path,
+        project_forbidden_commands: Sequence[str] = (),
+    ):
         self.config = config
         self.project_root = project_root
         self.run_dir = run_dir
+        self.project_forbidden_commands = tuple(project_forbidden_commands)
 
     def worker_initial(self, prompt: str) -> tuple[dict[str, Any], str, list[str]]:
         output_path = self.run_dir / "worker-output.json"
@@ -234,14 +239,14 @@ class CodexRunner:
             "-",
         ]
         result = run_process(cmd, self.project_root, prompt, self.config.worker_timeout)
-        events = parse_jsonl(result.stdout)
         ensure_codex_success(result, "Worker")
-        violations = find_forbidden_command_events(events, [])
+        events = parse_jsonl(result.stdout)
+        violations = find_forbidden_command_events(events, self.project_forbidden_commands)
         thread_id = extract_thread_id(events)
         if not thread_id:
             raise ProtocolError("Worker JSONL did not contain thread.started/thread_id.")
         payload = load_final_json(output_path, "Worker")
-        validate_json_schema(payload, load_schema(WORKER_SCHEMA_PATH))
+        validate_worker_result(payload)
         return payload, thread_id, violations
 
     def worker_resume(self, session_id: str, prompt: str) -> tuple[dict[str, Any], list[str]]:
@@ -258,14 +263,14 @@ class CodexRunner:
             "-",
         ]
         result = run_process(cmd, self.project_root, prompt, self.config.worker_timeout)
-        events = parse_jsonl(result.stdout)
         ensure_codex_success(result, "Worker resume")
-        violations = find_forbidden_command_events(events, [])
+        events = parse_jsonl(result.stdout)
+        violations = find_forbidden_command_events(events, self.project_forbidden_commands)
         resumed_id = extract_thread_id(events)
         if resumed_id and resumed_id != session_id:
             raise ProtocolError("Worker resume returned a different thread_id than the saved Worker session.")
         payload = load_final_json(output_path, "Worker resume")
-        validate_json_schema(payload, load_schema(WORKER_SCHEMA_PATH))
+        validate_worker_result(payload)
         return payload, violations
 
     def reviewer(self, prompt: str) -> tuple[dict[str, Any], list[str]]:
@@ -281,18 +286,19 @@ class CodexRunner:
             "-",
         ]
         result = run_process(cmd, self.project_root, prompt, self.config.reviewer_timeout)
-        events = parse_jsonl(result.stdout)
         ensure_codex_success(result, "Reviewer")
-        violations = find_forbidden_command_events(events, [])
+        events = parse_jsonl(result.stdout)
+        violations = find_forbidden_command_events(events, self.project_forbidden_commands)
         payload = load_final_json(output_path, "Reviewer")
         validate_json_schema(payload, load_schema(REVIEWER_SCHEMA_PATH))
         return payload, violations
 
     def _base_exec(self, sandbox: str, model: str, reasoning: str) -> list[str]:
-        # --ask-for-approval is a documented global flag, so place it before exec.
         return list(self.config.codex_command) + [
             "--ask-for-approval",
             "never",
+            "--config",
+            f'model_reasoning_effort="{reasoning}"',
             "exec",
             "-C",
             str(self.project_root),
@@ -300,8 +306,6 @@ class CodexRunner:
             sandbox,
             "--model",
             model,
-            "--config",
-            f'model_reasoning_effort="{reasoning}"',
             "--color",
             "never",
         ]
@@ -311,12 +315,16 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def safe_text(text: str) -> str:
+    return _LOG_SECRET_RE.sub(lambda match: f"{match.group(1)}{match.group(2)}<redacted>", str(text))
+
+
 def normalized_path_key(path: Path) -> str:
     return os.path.normcase(str(path.resolve()))
 
 
 def ec_print(message: str) -> None:
-    print(f"[EC] {message}", flush=True)
+    print(f"[EC] {safe_text(message)}", flush=True)
 
 
 def truncate(text: str, limit: int = 12000) -> str:
@@ -387,13 +395,7 @@ def _is_type(value: Any, expected: str) -> bool:
 
 
 def validate_json_schema(value: Any, schema: dict[str, Any], path: str = "$") -> None:
-    """Validate the JSON Schema subset used by this project.
-
-    v0.1 intentionally avoids a third-party jsonschema dependency. This validator
-    supports the exact standard keywords used by the bundled schemas and fails
-    closed on unsupported structural assumptions.
-    """
-
+    """Validate the JSON Schema subset used by the bundled v0.1 schemas."""
     if "oneOf" in schema:
         matches = 0
         last_error: Exception | None = None
@@ -411,7 +413,6 @@ def validate_json_schema(value: Any, schema: dict[str, Any], path: str = "$") ->
 
     if "const" in schema and value != schema["const"]:
         raise _schema_error(path, f"expected constant {schema['const']!r}")
-
     if "enum" in schema and value not in schema["enum"]:
         raise _schema_error(path, f"value {value!r} is not in enum")
 
@@ -453,8 +454,7 @@ def validate_json_schema(value: Any, schema: dict[str, Any], path: str = "$") ->
                 validate_json_schema(item, item_schema, f"{path}[{index}]")
 
     if isinstance(value, dict):
-        required = schema.get("required", [])
-        for key in required:
+        for key in schema.get("required", []):
             if key not in value:
                 raise _schema_error(path, f"missing required property {key!r}")
         properties = schema.get("properties", {})
@@ -476,6 +476,16 @@ def validate_json_schema(value: Any, schema: dict[str, Any], path: str = "$") ->
             pass
         else:
             validate_json_schema(value, schema["then"], path)
+
+
+def validate_worker_result(payload: dict[str, Any]) -> None:
+    validate_json_schema(payload, load_schema(WORKER_SCHEMA_PATH))
+    if payload.get("status") == "COMPLETED":
+        failed_checks = [check.get("name", "unnamed") for check in payload.get("checks", []) if check.get("status") == "FAIL"]
+        if failed_checks:
+            raise ProtocolError(
+                "Worker returned COMPLETED with failed checks: " + ", ".join(str(name) for name in failed_checks)
+            )
 
 
 def discover_codex_command() -> tuple[str, ...]:
@@ -500,7 +510,7 @@ def build_runtime_config() -> RuntimeConfig:
         os.environ.get("ENGINEERING_CONTROLLER_STATE_HOME", str(Path.home() / ".engineering-controller"))
     ).expanduser()
 
-    def env_int(name: str, default: int, minimum: int = 1) -> int:
+    def env_int(name: str, default: int) -> int:
         raw = os.environ.get(name)
         if raw is None:
             return default
@@ -508,8 +518,8 @@ def build_runtime_config() -> RuntimeConfig:
             value = int(raw)
         except ValueError as exc:
             raise ValidationError(f"{name} must be an integer.") from exc
-        if value < minimum:
-            raise ValidationError(f"{name} must be >= {minimum}.")
+        if value < 1:
+            raise ValidationError(f"{name} must be >= 1.")
         return value
 
     return RuntimeConfig(
@@ -521,37 +531,6 @@ def build_runtime_config() -> RuntimeConfig:
         state_home=state_home,
         rtk_path=shutil.which("rtk") or shutil.which("rtk.exe"),
     )
-
-
-def run_process(args: Sequence[str], cwd: Path, input_text: str | None, timeout: int) -> ExecResult:
-    creationflags = 0
-    start_new_session = os.name != "nt"
-    if os.name == "nt":
-        creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-
-    try:
-        proc = subprocess.Popen(
-            list(args),
-            cwd=str(cwd),
-            stdin=subprocess.PIPE if input_text is not None else subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            start_new_session=start_new_session,
-            creationflags=creationflags,
-        )
-    except OSError as exc:
-        raise ProcessError(f"Unable to start process {Path(args[0]).name}: {exc}") from exc
-
-    try:
-        stdout, stderr = proc.communicate(input=input_text, timeout=timeout)
-        return ExecResult(tuple(args), proc.returncode, stdout or "", stderr or "", False)
-    except subprocess.TimeoutExpired:
-        terminate_process_tree(proc)
-        stdout, stderr = proc.communicate()
-        return ExecResult(tuple(args), proc.returncode if proc.returncode is not None else -1, stdout or "", stderr or "", True)
 
 
 def terminate_process_tree(proc: subprocess.Popen[str]) -> None:
@@ -581,14 +560,43 @@ def terminate_process_tree(proc: subprocess.Popen[str]) -> None:
         pass
 
 
+def run_process(args: Sequence[str], cwd: Path, input_text: str | None, timeout: int) -> ExecResult:
+    creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) if os.name == "nt" else 0
+    try:
+        proc = subprocess.Popen(
+            list(args),
+            cwd=str(cwd),
+            stdin=subprocess.PIPE if input_text is not None else subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            start_new_session=os.name != "nt",
+            creationflags=creationflags,
+        )
+    except OSError as exc:
+        raise ProcessError(f"Unable to start process {Path(args[0]).name}: {exc}") from exc
+
+    try:
+        stdout, stderr = proc.communicate(input=input_text, timeout=timeout)
+        return ExecResult(tuple(args), proc.returncode, stdout or "", stderr or "", False)
+    except subprocess.TimeoutExpired:
+        terminate_process_tree(proc)
+        stdout, stderr = proc.communicate()
+        return ExecResult(
+            tuple(args), proc.returncode if proc.returncode is not None else -1, stdout or "", stderr or "", True
+        )
+
+
 def ensure_codex_success(result: ExecResult, label: str) -> None:
     if result.timed_out:
         raise ProcessError(f"{label} timed out.")
     if result.returncode != 0:
         detail = truncate(result.stderr.strip(), 1200)
-        if detail:
-            raise ProcessError(f"{label} exited with code {result.returncode}: {detail}")
-        raise ProcessError(f"{label} exited with code {result.returncode}.")
+        raise ProcessError(
+            f"{label} exited with code {result.returncode}{': ' + detail if detail else '.'}"
+        )
 
 
 def parse_jsonl(text: str) -> list[dict[str, Any]]:
@@ -748,13 +756,11 @@ def workspace_fingerprint(root: Path, changed_files: Sequence[str]) -> str:
 
 
 def git_snapshot(root: Path) -> GitSnapshot:
-    branch = git_branch(root)
-    head = git_head(root)
     changed = git_changed_files(root)
     return GitSnapshot(
         root=root,
-        branch=branch,
-        head=head,
+        branch=git_branch(root),
+        head=git_head(root),
         changed_files=changed,
         diff_stat=git_diff_stat(root, changed),
         workspace_fingerprint=workspace_fingerprint(root, changed),
@@ -762,8 +768,7 @@ def git_snapshot(root: Path) -> GitSnapshot:
 
 
 def is_known_secret_path(relative_path: str) -> bool:
-    normalized = relative_path.replace("\\", "/")
-    name = PurePosixPath(normalized).name.casefold()
+    name = PurePosixPath(relative_path.replace("\\", "/")).name.casefold()
     if name in SAFE_ENV_TEMPLATE_NAMES:
         return False
     if name == ".env" or name.startswith(".env."):
@@ -780,10 +785,13 @@ def path_matches_pattern(relative_path: str, pattern: str) -> bool:
 
 
 def protected_path_reason(relative_path: str, policy: Policy) -> str | None:
-    if is_known_secret_path(relative_path):
+    normalized = relative_path.replace("\\", "/")
+    if PurePosixPath(normalized).name.casefold() == PROJECT_POLICY_FILENAME.casefold():
+        return "engineering-controller project policy"
+    if is_known_secret_path(normalized):
         return "known secret/credential path"
     for pattern in policy.protected_paths:
-        if path_matches_pattern(relative_path, pattern):
+        if path_matches_pattern(normalized, pattern):
             return f"project protected path pattern: {pattern}"
     return None
 
@@ -817,10 +825,7 @@ def resolve_prompt_path(root: Path, cwd: Path, raw: str) -> Path:
 def file_sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
-        while True:
-            chunk = handle.read(1024 * 1024)
-            if not chunk:
-                break
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
 
@@ -853,8 +858,7 @@ def load_project_policy(root: Path) -> Policy:
 
 
 def policy_as_context(root: Path, policy: Policy) -> str:
-    policy_path = root / PROJECT_POLICY_FILENAME
-    if not policy_path.exists():
+    if not (root / PROJECT_POLICY_FILENAME).exists():
         return "No project-specific engineering-controller policy is present."
     return json.dumps(
         {
@@ -870,8 +874,7 @@ def policy_as_context(root: Path, policy: Policy) -> str:
 
 
 def gate_fingerprint(gate: dict[str, Any]) -> str:
-    raw = f"{gate.get('type', '')}:{gate.get('key', '')}"
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    return hashlib.sha256(f"{gate.get('type', '')}:{gate.get('key', '')}".encode("utf-8")).hexdigest()
 
 
 def human_flags_in(values: Sequence[str], policy: Policy) -> list[str]:
@@ -880,9 +883,7 @@ def human_flags_in(values: Sequence[str], policy: Policy) -> list[str]:
 
 def command_guard_from_gate(gate: dict[str, Any], policy: Policy) -> str | None:
     proposed = gate.get("proposed_action", "")
-    if isinstance(proposed, str):
-        return forbidden_command_reason(proposed, policy.forbidden_commands)
-    return None
+    return forbidden_command_reason(proposed, policy.forbidden_commands) if isinstance(proposed, str) else None
 
 
 def check_snapshot_invariants(snapshot: GitSnapshot, state: dict[str, Any], policy: Policy) -> None:
@@ -894,9 +895,28 @@ def check_snapshot_invariants(snapshot: GitSnapshot, state: dict[str, Any], poli
 
 
 def build_worker_initial_prompt(root: Path, prompt_path: Path, policy: Policy) -> str:
-    relative_prompt = prompt_path.relative_to(root).as_posix()
     original = load_text(prompt_path)
-    return f"""ENGINEERING-CONTROLLER WORKER RUN\n\nPROJECT TARGET: {root}\nGOVERNING PROMPT/SPEC PATH: {relative_prompt}\n\n=== CONTROLLER WORKER POLICY ===\n{load_text(WORKER_POLICY_PATH)}\n\n=== CONTEXT BUDGET ===\n{load_text(CONTEXT_BUDGET_PATH)}\n\n=== PROJECT RESTRICTIONS ===\n{policy_as_context(root, policy)}\n\n=== GOVERNING PROJECT PROMPT/SPEC ===\n{original}\n\n=== END GOVERNING PROJECT PROMPT/SPEC ===\n\nImplement and validate the requested task inside the authorized PROJECT TARGET. Continue autonomously while inside scope and policy. Finish with only the JSON object required by the Worker schema.\n"""
+    relative_prompt = prompt_path.relative_to(root).as_posix()
+    return f"""ENGINEERING-CONTROLLER WORKER RUN
+
+PROJECT TARGET: {root}
+GOVERNING PROMPT/SPEC PATH: {relative_prompt}
+
+=== CONTROLLER WORKER POLICY ===
+{load_text(WORKER_POLICY_PATH)}
+
+=== CONTEXT BUDGET ===
+{load_text(CONTEXT_BUDGET_PATH)}
+
+=== PROJECT RESTRICTIONS ===
+{policy_as_context(root, policy)}
+
+=== GOVERNING PROJECT PROMPT/SPEC ===
+{original}
+=== END GOVERNING PROJECT PROMPT/SPEC ===
+
+Implement and validate the requested task inside the authorized PROJECT TARGET. Continue autonomously while inside scope and policy. Finish with only the JSON object required by the Worker schema.
+"""
 
 
 def build_reviewer_prompt(
@@ -906,23 +926,70 @@ def build_reviewer_prompt(
     snapshot: GitSnapshot,
     policy: Policy,
 ) -> str:
-    relative_prompt = prompt_path.relative_to(root).as_posix()
     changed = "\n".join(snapshot.changed_files[:200]) if snapshot.changed_files else "(none)"
-    return f"""ENGINEERING-CONTROLLER INDEPENDENT REVIEW\n\n=== REVIEWER POLICY ===\n{load_text(REVIEWER_POLICY_PATH)}\n\n=== HUMAN_REQUIRED POLICY ===\n{load_text(HUMAN_POLICY_PATH)}\n\n=== CONTEXT BUDGET ===\n{load_text(CONTEXT_BUDGET_PATH)}\n\nPROJECT TARGET: {root}\nGOVERNING PROJECT PROMPT/SPEC PATH: {relative_prompt}\nBRANCH: {snapshot.branch}\nHEAD: {snapshot.head}\n\nCHANGED FILES:\n{changed}\n\nGIT DIFF STAT:\n{snapshot.diff_stat}\n\nPROJECT RESTRICTIONS:\n{policy_as_context(root, policy)}\n\nWORKER GATE JSON:\n{json.dumps(gate, ensure_ascii=False, indent=2)}\n\nReview only this gate. Read the governing prompt/SPEC or evidence-referenced files only as needed. Do not modify anything. Finish with only the JSON object required by the Reviewer schema.\n"""
+    return f"""ENGINEERING-CONTROLLER INDEPENDENT REVIEW
+
+=== REVIEWER POLICY ===
+{load_text(REVIEWER_POLICY_PATH)}
+
+=== HUMAN_REQUIRED POLICY ===
+{load_text(HUMAN_POLICY_PATH)}
+
+=== CONTEXT BUDGET ===
+{load_text(CONTEXT_BUDGET_PATH)}
+
+PROJECT TARGET: {root}
+GOVERNING PROJECT PROMPT/SPEC PATH: {prompt_path.relative_to(root).as_posix()}
+BRANCH: {snapshot.branch}
+HEAD: {snapshot.head}
+
+CHANGED FILES:
+{changed}
+
+GIT DIFF STAT:
+{snapshot.diff_stat}
+
+PROJECT RESTRICTIONS:
+{policy_as_context(root, policy)}
+
+WORKER GATE JSON:
+{json.dumps(gate, ensure_ascii=False, indent=2)}
+
+Review only this gate. Read the governing prompt/SPEC or evidence-referenced files only as needed. Do not modify anything. Finish with only the JSON object required by the Reviewer schema.
+"""
 
 
-def build_worker_review_followup(
-    decision: dict[str, Any], gate: dict[str, Any], snapshot: GitSnapshot
-) -> str:
-    return f"""ENGINEERING-CONTROLLER GATE RESPONSE\n\nGate type: {gate['type']}\nGate key: {gate['key']}\nReviewer decision: {decision['decision']}\nReviewer reason: {decision['reason']}\nReviewer instructions: {decision['instructions']}\n\nCurrent Git diff stat:\n{snapshot.diff_stat}\n\nContinue the same Worker task. Apply only the approved/revised direction. Global safety policy remains unchanged. Do not interpret APPROVE as permission for any globally prohibited action. Finish again with only the Worker-schema JSON object.\n"""
+def build_worker_review_followup(decision: dict[str, Any], gate: dict[str, Any], snapshot: GitSnapshot) -> str:
+    return f"""ENGINEERING-CONTROLLER GATE RESPONSE
+
+Gate type: {gate['type']}
+Gate key: {gate['key']}
+Reviewer decision: {decision['decision']}
+Reviewer reason: {decision['reason']}
+Reviewer instructions: {decision['instructions']}
+
+Current Git diff stat:
+{snapshot.diff_stat}
+
+Continue the same Worker task. Apply only the approved/revised direction. Global safety policy remains unchanged. APPROVE never authorizes a globally prohibited action. Finish again with only the Worker-schema JSON object.
+"""
 
 
-def build_human_resume_followup(
-    state: dict[str, Any], snapshot: GitSnapshot, note: str | None
-) -> str:
-    note_text = note.strip() if note else "(no explicit human note supplied; re-evaluate whether repository state resolves the gate)"
+def build_human_resume_followup(state: dict[str, Any], snapshot: GitSnapshot, note: str | None) -> str:
     gate = state.get("current_gate") or {}
-    return f"""ENGINEERING-CONTROLLER HUMAN RESUME\n\nThe previous automated run stopped at HUMAN_REQUIRED.\nPrevious gate type: {gate.get('type', '(unknown)')}\nPrevious gate key: {gate.get('key', '(unknown)')}\nHuman note: {note_text}\n\nCurrent Git diff stat:\n{snapshot.diff_stat}\n\nRe-evaluate the current PROJECT TARGET state and continue only if the human action/note genuinely resolves the gate within the governing prompt/SPEC and global safety policy. A resume is never authorization for globally prohibited operations. If a material decision remains unresolved, return GATE_REQUIRED again. Finish with only the Worker-schema JSON object.\n"""
+    note_text = note.strip() if note else "(no explicit human note supplied; re-evaluate whether repository state resolves the gate)"
+    return f"""ENGINEERING-CONTROLLER HUMAN RESUME
+
+The previous automated run stopped at HUMAN_REQUIRED.
+Previous gate type: {gate.get('type', '(unknown)')}
+Previous gate key: {gate.get('key', '(unknown)')}
+Human note: {note_text}
+
+Current Git diff stat:
+{snapshot.diff_stat}
+
+Re-evaluate the PROJECT TARGET and continue only if the human action/note genuinely resolves the gate within the governing prompt/SPEC and safety policy. A resume is never authorization for globally prohibited operations. If a material decision remains unresolved, return GATE_REQUIRED again. Finish with only the Worker-schema JSON object.
+"""
 
 
 def save_state(run_dir: Path, state: dict[str, Any]) -> None:
@@ -962,19 +1029,19 @@ def record_human_required(
     state: dict[str, Any], run_dir: Path, logger: RunLogger, reason: str, snapshot: GitSnapshot | None
 ) -> None:
     state["status"] = "HUMAN_REQUIRED"
-    state["human_required_reason"] = reason
+    state["human_required_reason"] = safe_text(reason)
     if snapshot is not None:
         state["workspace_fingerprint_at_human"] = snapshot.workspace_fingerprint
     save_state(run_dir, state)
     logger.write(f"HUMAN_REQUIRED reason={reason}")
     ec_print("HUMAN_REQUIRED")
-    print(f"Motivo: {reason}", flush=True)
+    print(f"Motivo: {safe_text(reason)}", flush=True)
     print(f"Estado salvo: {run_dir / 'state.json'}", flush=True)
 
 
 def record_failed(state: dict[str, Any], run_dir: Path, logger: RunLogger, reason: str) -> None:
     state["status"] = "FAILED"
-    state["failure_reason"] = reason
+    state["failure_reason"] = safe_text(reason)
     save_state(run_dir, state)
     logger.write(f"FAILED reason={reason}")
     ec_print(f"FAILED — {reason}")
@@ -998,8 +1065,6 @@ def process_worker_result(
     policy: Policy,
     runner: CodexRunner,
 ) -> int:
-    """Run the state machine from one Worker result until a terminal state."""
-
     while True:
         state["worker_runs"] += 1
         write_json_atomic(run_dir / "worker-result.json", worker_result)
@@ -1011,8 +1076,13 @@ def process_worker_result(
         check_snapshot_invariants(snapshot, state, policy)
 
         if command_violations:
-            reason = "Worker executed a prohibited command category: " + ", ".join(command_violations)
-            record_human_required(state, run_dir, logger, reason, snapshot)
+            record_human_required(
+                state,
+                run_dir,
+                logger,
+                "Worker executed a prohibited command category: " + ", ".join(command_violations),
+                snapshot,
+            )
             return 2
 
         status = worker_result["status"]
@@ -1038,6 +1108,7 @@ def process_worker_result(
         gate = worker_result.get("gate")
         if not isinstance(gate, dict):
             raise ProtocolError("GATE_REQUIRED Worker result has no valid gate object.")
+
         state["status"] = "GATE_PENDING"
         state["current_gate"] = gate
         fingerprint = gate_fingerprint(gate)
@@ -1093,8 +1164,9 @@ def process_worker_result(
         save_state(run_dir, state)
         review_number = state["review_count"] + 1
         ec_print(f"Reviewer #{review_number} iniciado")
-        reviewer_prompt = build_reviewer_prompt(root, prompt_path, gate, snapshot, policy)
-        reviewer_result, reviewer_command_violations = runner.reviewer(reviewer_prompt)
+        reviewer_result, reviewer_command_violations = runner.reviewer(
+            build_reviewer_prompt(root, prompt_path, gate, snapshot, policy)
+        )
         state["review_count"] = review_number
         state["last_review"] = reviewer_result
         write_json_atomic(run_dir / "reviewer-result.json", reviewer_result)
@@ -1102,18 +1174,18 @@ def process_worker_result(
         logger.write(f"Reviewer #{review_number} decision={reviewer_result['decision']}")
         ec_print(f"Reviewer #{review_number}: {reviewer_result['decision']}")
 
+        snapshot = git_snapshot(root)
+        check_snapshot_invariants(snapshot, state, policy)
+
         if reviewer_command_violations:
             record_human_required(
                 state,
                 run_dir,
                 logger,
                 "Reviewer executed a prohibited command category: " + ", ".join(reviewer_command_violations),
-                git_snapshot(root),
+                snapshot,
             )
             return 2
-
-        snapshot = git_snapshot(root)
-        check_snapshot_invariants(snapshot, state, policy)
 
         review_human_flags = human_flags_in(reviewer_result.get("risk_flags", []), policy)
         combined_flags = sorted(set(worker_human_flags) | set(review_human_flags))
@@ -1130,7 +1202,6 @@ def process_worker_result(
         if reviewer_result["decision"] == "HUMAN_REQUIRED":
             record_human_required(state, run_dir, logger, reviewer_result["reason"], snapshot)
             return 2
-
         if reviewer_result["decision"] not in {"APPROVE", "REVISE"}:
             raise ProtocolError(f"Unsupported Reviewer decision: {reviewer_result['decision']}")
 
@@ -1138,15 +1209,15 @@ def process_worker_result(
         if not isinstance(session_id, str) or not session_id:
             raise ProtocolError("Worker session ID is missing; cannot resume after review.")
 
-        followup = build_worker_review_followup(reviewer_result, gate, snapshot)
         state["status"] = "WORKER"
         save_state(run_dir, state)
         ec_print(f"Worker #{state['worker_runs'] + 1} retomado")
-        worker_result, command_violations = runner.worker_resume(session_id, followup)
+        worker_result, command_violations = runner.worker_resume(
+            session_id, build_worker_review_followup(reviewer_result, gate, snapshot)
+        )
 
 
 def execute_command(prompt_arg: str, cwd: Path) -> int:
-    # Validate bundled schemas before touching a target project.
     load_schema(WORKER_SCHEMA_PATH)
     load_schema(REVIEWER_SCHEMA_PATH)
     load_schema(PROJECT_POLICY_SCHEMA_PATH)
@@ -1196,18 +1267,17 @@ def execute_command(prompt_arg: str, cwd: Path) -> int:
         if not config.rtk_path:
             state["warnings"].append("RTK_NOT_FOUND")
             ec_print("WARN: RTK não encontrado; execução continuará sem RTK")
-        logger.write(
-            f"START project={root} branch={snapshot.branch} head={snapshot.head} prompt={prompt_relative}"
-        )
+        logger.write(f"START project={root} branch={snapshot.branch} head={snapshot.head} prompt={prompt_relative}")
         save_state(run_dir, state)
         ec_print("Preflight OK")
         ec_print("Worker #1 iniciado")
         state["status"] = "WORKER"
         save_state(run_dir, state)
 
-        runner = CodexRunner(config, root, run_dir)
-        worker_prompt = build_worker_initial_prompt(root, prompt_path, policy)
-        worker_result, thread_id, command_violations = runner.worker_initial(worker_prompt)
+        runner = CodexRunner(config, root, run_dir, policy.forbidden_commands)
+        worker_result, thread_id, command_violations = runner.worker_initial(
+            build_worker_initial_prompt(root, prompt_path, policy)
+        )
         state["worker_session_id"] = thread_id
         save_state(run_dir, state)
         return process_worker_result(
@@ -1276,11 +1346,12 @@ def resume_command(note: str | None, cwd: Path) -> int:
         logger.write("RESUME requested")
         ec_print(f"Resume: {state['run_id']}")
         ec_print(f"Worker #{state['worker_runs'] + 1} retomado")
-        runner = CodexRunner(config, root, run_dir)
-        followup = build_human_resume_followup(state, snapshot, note)
+        runner = CodexRunner(config, root, run_dir, policy.forbidden_commands)
         state["status"] = "WORKER"
         save_state(run_dir, state)
-        worker_result, command_violations = runner.worker_resume(session_id, followup)
+        worker_result, command_violations = runner.worker_resume(
+            session_id, build_human_resume_followup(state, snapshot, note)
+        )
         return process_worker_result(
             worker_result=worker_result,
             command_violations=command_violations,
@@ -1321,29 +1392,22 @@ def build_parser() -> argparse.ArgumentParser:
     execute_parser.add_argument("prompt", help="Prompt/SPEC file inside the PROJECT TARGET.")
 
     resume_parser = subparsers.add_parser("resume", help="Resume the current HUMAN_REQUIRED run.")
-    resume_parser.add_argument(
-        "note",
-        nargs="*",
-        help="Optional human resolution note forwarded only to the resumed Worker.",
-    )
+    resume_parser.add_argument("note", nargs="*", help="Optional human resolution note for the resumed Worker.")
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    parser = build_parser()
-    args = parser.parse_args(argv)
+    args = build_parser().parse_args(argv)
     cwd = Path.cwd().resolve()
     try:
         if args.command == "execute":
             return execute_command(args.prompt, cwd)
         if args.command == "resume":
-            note = " ".join(args.note).strip() or None
-            return resume_command(note, cwd)
-        parser.error("unsupported command")
-        return 2
+            return resume_command(" ".join(args.note).strip() or None, cwd)
+        raise ValidationError("Unsupported command.")
     except HumanRequired as exc:
         ec_print("HUMAN_REQUIRED")
-        print(f"Motivo: {exc}", flush=True)
+        print(f"Motivo: {safe_text(str(exc))}", flush=True)
         return 2
     except ControllerError as exc:
         ec_print(f"FAILED — {exc.category}: {exc}")

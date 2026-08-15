@@ -168,6 +168,13 @@ class RunLogger:
 class StateStore:
     def __init__(self, state_home: Path, project_root: Path):
         self.project_root = project_root.resolve()
+        state_home = state_home.expanduser().resolve()
+        try:
+            state_home.relative_to(self.project_root)
+        except ValueError:
+            pass
+        else:
+            raise ValidationError("Runtime state directory must be outside the PROJECT TARGET.")
         repo_hash = hashlib.sha256(normalized_path_key(self.project_root).encode("utf-8")).hexdigest()[:20]
         self.repo_dir = state_home / "runs" / repo_hash
         self.current_path = self.repo_dir / "current.json"
@@ -506,9 +513,10 @@ def discover_codex_command() -> tuple[str, ...]:
 
 
 def build_runtime_config() -> RuntimeConfig:
-    state_home = Path(
-        os.environ.get("ENGINEERING_CONTROLLER_STATE_HOME", str(Path.home() / ".engineering-controller"))
-    ).expanduser()
+    state_home_value = os.environ.get("ENGINEERING_CONTROLLER_STATE_HOME")
+    if state_home_value is None:
+        state_home_value = str(Path.home() / ".engineering-controller")
+    state_home = Path(state_home_value).expanduser()
 
     def env_int(name: str, default: int) -> int:
         raw = os.environ.get(name)

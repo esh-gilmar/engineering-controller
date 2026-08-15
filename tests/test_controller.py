@@ -75,7 +75,7 @@ class SyntheticRepo:
         if env_extra:
             env.update(env_extra)
         return subprocess.run(
-            [sys.executable, str(CONTROLLER), *args],
+            [sys.executable, "-X", "utf8", str(CONTROLLER), *args],
             cwd=str(self.root),
             env=env,
             capture_output=True,
@@ -266,7 +266,7 @@ class ControllerUnitTests(unittest.TestCase):
             )
             (base / "TASK.md").write_text("task\n", encoding="utf-8")
             result = subprocess.run(
-                [sys.executable, str(CONTROLLER), "execute", "TASK.md"],
+                [sys.executable, "-X", "utf8", str(CONTROLLER), "execute", "TASK.md"],
                 cwd=str(base),
                 env=env,
                 capture_output=True,
@@ -285,11 +285,22 @@ class ControllerUnitTests(unittest.TestCase):
 
     def test_rtk_is_optional(self):
         fake_cmd = json.dumps([sys.executable, str(FAKE_CODEX)])
-        with mock.patch.dict(os.environ, {"ENGINEERING_CONTROLLER_CODEX_CMD": fake_cmd}, clear=True), mock.patch.object(
-            controller.shutil, "which", return_value=None
-        ):
-            config = controller.build_runtime_config()
-            self.assertIsNone(config.rtk_path)
+        with tempfile.TemporaryDirectory() as temp:
+            env = {
+                "ENGINEERING_CONTROLLER_CODEX_CMD": fake_cmd,
+                "ENGINEERING_CONTROLLER_STATE_HOME": str(Path(temp) / "state"),
+            }
+            with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(
+                controller.shutil, "which", return_value=None
+            ):
+                config = controller.build_runtime_config()
+                self.assertIsNone(config.rtk_path)
+
+    def test_state_home_inside_project_target_is_rejected(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            with self.assertRaises(controller.ValidationError):
+                controller.StateStore(root / ".controller-state", root)
 
     def test_worker_schema_accepts_project_extension_risk_flag(self):
         schema = controller.load_schema(controller.WORKER_SCHEMA_PATH)

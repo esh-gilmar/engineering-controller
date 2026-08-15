@@ -50,6 +50,11 @@ class SyntheticRepo:
             encoding="utf-8",
         )
 
+    def commit_policy(self, policy: dict) -> None:
+        (self.root / controller.PROJECT_POLICY_FILENAME).write_text(json.dumps(policy), encoding="utf-8")
+        self._git("add", controller.PROJECT_POLICY_FILENAME)
+        self._git("commit", "-m", "test: restrictive controller policy")
+
     def env(self, scenario: str, **extra: str) -> dict[str, str]:
         env = os.environ.copy()
         env.update(
@@ -188,10 +193,7 @@ class ControllerFlowTests(unittest.TestCase):
         self.assertEqual(self.repo.counts()["reviewer"], 3)
 
     def test_project_policy_can_reduce_loop_limit(self):
-        policy = {"max_same_gate": 1}
-        (self.repo.root / controller.PROJECT_POLICY_FILENAME).write_text(json.dumps(policy), encoding="utf-8")
-        self.repo._git("add", controller.PROJECT_POLICY_FILENAME)
-        self.repo._git("commit", "-m", "test: restrictive controller policy")
+        self.repo.commit_policy({"max_same_gate": 1})
         result = self.repo.run("gate_loop", "execute", "TASK.md")
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
         self.assertEqual(self.repo.counts()["reviewer"], 1)
@@ -201,10 +203,27 @@ class ControllerFlowTests(unittest.TestCase):
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
         self.assertIn("Protected path changed: .env", result.stdout)
 
+    def test_controller_project_policy_is_protected_during_run(self):
+        self.repo.commit_policy({"max_same_gate": 2})
+        result = self.repo.run("policy_change", "execute", "TASK.md")
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("Protected path changed: .engineering-controller-policy.json", result.stdout)
+
     def test_prohibited_command_event_requires_human(self):
         result = self.repo.run("command_violation", "execute", "TASK.md")
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
         self.assertIn("prohibited command category", result.stdout)
+
+    def test_project_forbidden_command_event_requires_human(self):
+        self.repo.commit_policy({"forbidden_commands": ["synthetic-custom-forbidden"]})
+        result = self.repo.run("project_command_violation", "execute", "TASK.md")
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("project-forbidden command pattern", result.stdout)
+
+    def test_completed_with_failed_check_fails_closed(self):
+        result = self.repo.run("completed_failed_check", "execute", "TASK.md")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("COMPLETED with failed checks", result.stdout)
 
     def test_dirty_worktree_requires_human_before_worker(self):
         (self.repo.root / "TASK.md").write_text("dirty\n", encoding="utf-8")

@@ -1,7 +1,4 @@
 {
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "worker-result.schema.json",
-  "title": "engineering-controller Worker Result",
   "type": "object",
   "additionalProperties": false,
   "required": ["status", "summary", "checks", "gate", "failure"],
@@ -10,59 +7,43 @@
       "type": "string",
       "enum": ["COMPLETED", "GATE_REQUIRED", "FAILED"]
     },
-    "summary": {
-      "type": "string",
-      "minLength": 1,
-      "maxLength": 1200
-    },
+    "summary": {"type": "string"},
     "checks": {
       "type": "array",
-      "maxItems": 20,
       "items": {
         "type": "object",
         "additionalProperties": false,
         "required": ["name", "status", "detail"],
         "properties": {
-          "name": {"type": "string", "minLength": 1, "maxLength": 160},
+          "name": {"type": "string"},
           "status": {"type": "string", "enum": ["PASS", "FAIL", "WARN", "SKIP"]},
-          "detail": {"type": "string", "maxLength": 1000}
+          "detail": {"type": "string"}
         }
       }
     },
     "gate": {
-      "oneOf": [
+      "anyOf": [
         {"type": "null"},
         {
           "type": "object",
           "additionalProperties": false,
           "required": ["type", "key", "reason", "proposed_action", "risk_flags", "evidence"],
           "properties": {
-            "type": {"type": "string", "minLength": 1, "maxLength": 80},
-            "key": {"type": "string", "minLength": 1, "maxLength": 120},
-            "reason": {"type": "string", "minLength": 1, "maxLength": 1500},
-            "proposed_action": {"type": "string", "minLength": 1, "maxLength": 1500},
-            "risk_flags": {
-              "type": "array",
-              "uniqueItems": true,
-              "maxItems": 30,
-              "items": {
-                "type": "string",
-                "minLength": 1,
-                "maxLength": 80,
-                "pattern": "^[A-Z][A-Z0-9_]*$"
-              }
-            },
+            "type": {"type": "string"},
+            "key": {"type": "string"},
+            "reason": {"type": "string"},
+            "proposed_action": {"type": "string"},
+            "risk_flags": {"type": "array", "items": {"type": "string"}},
             "evidence": {
               "type": "array",
-              "maxItems": 12,
               "items": {
                 "type": "object",
                 "additionalProperties": false,
                 "required": ["kind", "ref", "note"],
                 "properties": {
                   "kind": {"type": "string", "enum": ["FILE", "SPEC", "TEST", "COMMAND", "GIT", "LOG"]},
-                  "ref": {"type": "string", "minLength": 1, "maxLength": 500},
-                  "note": {"type": "string", "maxLength": 1000}
+                  "ref": {"type": "string"},
+                  "note": {"type": "string"}
                 }
               }
             }
@@ -71,7 +52,7 @@
       ]
     },
     "failure": {
-      "oneOf": [
+      "anyOf": [
         {"type": "null"},
         {
           "type": "object",
@@ -79,24 +60,10 @@
           "required": ["category", "reason"],
           "properties": {
             "category": {"type": "string", "enum": ["TASK", "ENVIRONMENT"]},
-            "reason": {"type": "string", "minLength": 1, "maxLength": 1500}
+            "reason": {"type": "string"}
           }
         }
       ]
     }
-  },
-  "allOf": [
-    {
-      "if": {"properties": {"status": {"const": "GATE_REQUIRED"}}, "required": ["status"]},
-      "then": {"properties": {"gate": {"type": "object"}, "failure": {"type": "null"}}}
-    },
-    {
-      "if": {"properties": {"status": {"const": "FAILED"}}, "required": ["status"]},
-      "then": {"properties": {"gate": {"type": "null"}, "failure": {"type": "object"}}}
-    },
-    {
-      "if": {"properties": {"status": {"const": "COMPLETED"}}, "required": ["status"]},
-      "then": {"properties": {"gate": {"type": "null"}, "failure": {"type": "null"}}}
-    }
-  ]
+  }
 }

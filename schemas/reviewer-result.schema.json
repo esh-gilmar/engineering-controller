@@ -1,7 +1,4 @@
 {
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "reviewer-result.schema.json",
-  "title": "engineering-controller Reviewer Result",
   "type": "object",
   "additionalProperties": false,
   "required": ["decision", "reason", "instructions", "risk_flags"],
@@ -10,25 +7,8 @@
       "type": "string",
       "enum": ["APPROVE", "REVISE", "HUMAN_REQUIRED"]
     },
-    "reason": {
-      "type": "string",
-      "minLength": 1,
-      "maxLength": 1500
-    },
-    "instructions": {
-      "type": "string",
-      "maxLength": 2000
-    },
-    "risk_flags": {
-      "type": "array",
-      "uniqueItems": true,
-      "maxItems": 30,
-      "items": {
-        "type": "string",
-        "minLength": 1,
-        "maxLength": 80,
-        "pattern": "^[A-Z][A-Z0-9_]*$"
-      }
-    }
+    "reason": {"type": "string"},
+    "instructions": {"type": "string"},
+    "risk_flags": {"type": "array", "items": {"type": "string"}}
   }
 }

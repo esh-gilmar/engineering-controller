@@ -245,7 +245,7 @@ class CodexRunner:
             str(output_path),
             "-",
         ]
-        result = run_process(cmd, self.project_root, prompt, self.config.worker_timeout)
+        result = self._run_codex(cmd, prompt, self.config.worker_timeout, "Worker")
         ensure_codex_success(result, "Worker")
         events = parse_jsonl(result.stdout)
         violations = find_forbidden_command_events(events, self.project_forbidden_commands)
@@ -269,7 +269,7 @@ class CodexRunner:
             session_id,
             "-",
         ]
-        result = run_process(cmd, self.project_root, prompt, self.config.worker_timeout)
+        result = self._run_codex(cmd, prompt, self.config.worker_timeout, "Worker resume")
         ensure_codex_success(result, "Worker resume")
         events = parse_jsonl(result.stdout)
         violations = find_forbidden_command_events(events, self.project_forbidden_commands)
@@ -292,16 +292,35 @@ class CodexRunner:
             str(output_path),
             "-",
         ]
-        result = run_process(cmd, self.project_root, prompt, self.config.reviewer_timeout)
+        result = self._run_codex(cmd, prompt, self.config.reviewer_timeout, "Reviewer")
         ensure_codex_success(result, "Reviewer")
         events = parse_jsonl(result.stdout)
         violations = find_forbidden_command_events(events, self.project_forbidden_commands)
         payload = load_final_json(output_path, "Reviewer")
-        validate_json_schema(payload, load_schema(REVIEWER_SCHEMA_PATH))
+        validate_reviewer_result(payload)
         return payload, violations
+
+    def _run_codex(
+        self, args: Sequence[str], prompt: str, timeout: int, label: str
+    ) -> ExecResult:
+        before_hash = codex_user_config_hash()
+        result: ExecResult | None = None
+        run_error: BaseException | None = None
+        try:
+            result = run_process(args, self.project_root, prompt, timeout)
+        except BaseException as exc:
+            run_error = exc
+        after_hash = codex_user_config_hash()
+        if before_hash != after_hash:
+            raise HumanRequired(f"Codex user config changed during {label} execution.")
+        if run_error is not None:
+            raise run_error
+        assert result is not None
+        return result
 
     def _base_exec(self, sandbox: str, model: str, reasoning: str) -> list[str]:
         return list(self.config.codex_command) + [
+            "--ignore-user-config",
             "--ask-for-approval",
             "never",
             "--config",
@@ -338,6 +357,13 @@ def truncate(text: str, limit: int = 12000) -> str:
     if len(text) <= limit:
         return text
     return text[:limit] + f"\n... [truncated {len(text) - limit} chars]"
+
+
+def truncate_tail(text: str, limit: int = 1200) -> str:
+    if len(text) <= limit:
+        return text
+    omitted = len(text) - limit
+    return f"... [truncated {omitted} leading chars]\n" + text[-limit:]
 
 
 def load_text(path: Path) -> str:
@@ -403,6 +429,20 @@ def _is_type(value: Any, expected: str) -> bool:
 
 def validate_json_schema(value: Any, schema: dict[str, Any], path: str = "$") -> None:
     """Validate the JSON Schema subset used by the bundled v0.1 schemas."""
+    if "anyOf" in schema:
+        errors: list[Exception] = []
+        for candidate in schema["anyOf"]:
+            try:
+                validate_json_schema(value, candidate, path)
+                break
+            except ValidationError as exc:
+                errors.append(exc)
+        else:
+            detail = f"anyOf matched 0 branches"
+            if errors:
+                detail += f"; last error: {errors[-1]}"
+            raise _schema_error(path, detail)
+
     if "oneOf" in schema:
         matches = 0
         last_error: Exception | None = None
@@ -485,14 +525,84 @@ def validate_json_schema(value: Any, schema: dict[str, Any], path: str = "$") ->
             validate_json_schema(value, schema["then"], path)
 
 
-def validate_worker_result(payload: dict[str, Any]) -> None:
-    validate_json_schema(payload, load_schema(WORKER_SCHEMA_PATH))
-    if payload.get("status") == "COMPLETED":
-        failed_checks = [check.get("name", "unnamed") for check in payload.get("checks", []) if check.get("status") == "FAIL"]
+def _validate_text(value: Any, label: str, path: str, minimum: int = 0, maximum: int | None = None) -> None:
+    if not isinstance(value, str):
+        raise ProtocolError(f"{label} field {path} must be a string.")
+    if len(value) < minimum:
+        raise ProtocolError(f"{label} field {path} is shorter than {minimum} characters.")
+    if maximum is not None and len(value) > maximum:
+        raise ProtocolError(f"{label} field {path} exceeds {maximum} characters.")
+
+
+def _validate_risk_flags(values: Any, label: str, path: str) -> None:
+    if not isinstance(values, list):
+        raise ProtocolError(f"{label} field {path} must be an array.")
+    if len(values) > 30:
+        raise ProtocolError(f"{label} field {path} exceeds 30 items.")
+    if len(set(values)) != len(values):
+        raise ProtocolError(f"{label} field {path} must contain unique items.")
+    for index, value in enumerate(values):
+        _validate_text(value, label, f"{path}[{index}]", 1, 80)
+        if re.fullmatch(r"[A-Z][A-Z0-9_]*", value) is None:
+            raise ProtocolError(f"{label} field {path}[{index}] has an invalid risk flag.")
+
+
+def _validate_worker_semantics(payload: dict[str, Any]) -> None:
+    label = "Worker"
+    _validate_text(payload["summary"], label, "summary", 1, 1200)
+    checks = payload["checks"]
+    if len(checks) > 20:
+        raise ProtocolError("Worker field checks exceeds 20 items.")
+    for index, check in enumerate(checks):
+        _validate_text(check["name"], label, f"checks[{index}].name", 1, 160)
+        _validate_text(check["detail"], label, f"checks[{index}].detail", 0, 1000)
+
+    gate = payload["gate"]
+    if isinstance(gate, dict):
+        _validate_text(gate["type"], label, "gate.type", 1, 80)
+        _validate_text(gate["key"], label, "gate.key", 1, 120)
+        _validate_text(gate["reason"], label, "gate.reason", 1, 1500)
+        _validate_text(gate["proposed_action"], label, "gate.proposed_action", 1, 1500)
+        _validate_risk_flags(gate["risk_flags"], label, "gate.risk_flags")
+        if len(gate["evidence"]) > 12:
+            raise ProtocolError("Worker field gate.evidence exceeds 12 items.")
+        for index, evidence in enumerate(gate["evidence"]):
+            _validate_text(evidence["ref"], label, f"gate.evidence[{index}].ref", 1, 500)
+            _validate_text(evidence["note"], label, f"gate.evidence[{index}].note", 0, 1000)
+
+    failure = payload["failure"]
+    if isinstance(failure, dict):
+        _validate_text(failure["reason"], label, "failure.reason", 1, 1500)
+
+    status = payload["status"]
+    if status == "COMPLETED":
+        if gate is not None or failure is not None:
+            raise ProtocolError("Worker COMPLETED result must have gate=null and failure=null.")
+        failed_checks = [
+            check.get("name", "unnamed") for check in checks if check.get("status") == "FAIL"
+        ]
         if failed_checks:
             raise ProtocolError(
                 "Worker returned COMPLETED with failed checks: " + ", ".join(str(name) for name in failed_checks)
             )
+    elif status == "GATE_REQUIRED":
+        if not isinstance(gate, dict) or failure is not None:
+            raise ProtocolError("Worker GATE_REQUIRED result must have gate=object and failure=null.")
+    elif status == "FAILED":
+        if gate is not None or not isinstance(failure, dict):
+            raise ProtocolError("Worker FAILED result must have gate=null and failure=object.")
+
+
+def validate_worker_result(payload: dict[str, Any]) -> None:
+    validate_json_schema(payload, load_schema(WORKER_SCHEMA_PATH))
+    _validate_worker_semantics(payload)
+
+
+def validate_reviewer_result(payload: dict[str, Any]) -> None:
+    validate_json_schema(payload, load_schema(REVIEWER_SCHEMA_PATH))
+    _validate_text(payload["reason"], "Reviewer", "reason", 1, 1500)
+    _validate_text(payload["instructions"], "Reviewer", "instructions", 0, 2000)
+    _validate_risk_flags(payload["risk_flags"], "Reviewer", "risk_flags")
 
 
 def discover_codex_command() -> tuple[str, ...]:
@@ -601,7 +711,7 @@ def ensure_codex_success(result: ExecResult, label: str) -> None:
     if result.timed_out:
         raise ProcessError(f"{label} timed out.")
     if result.returncode != 0:
-        detail = truncate(result.stderr.strip(), 1200)
+        detail = truncate_tail(safe_text(result.stderr.strip()), 1200)
         raise ProcessError(
             f"{label} exited with code {result.returncode}{': ' + detail if detail else '.'}"
         )
@@ -836,6 +946,22 @@ def file_sha256(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def codex_user_config_path() -> Path:
+    codex_home = os.environ.get("CODEX_HOME")
+    base = Path(codex_home).expanduser() if codex_home else Path.home() / ".codex"
+    return base / "config.toml"
+
+
+def codex_user_config_hash() -> str | None:
+    path = codex_user_config_path()
+    if not path.is_file():
+        return None
+    try:
+        return file_sha256(path)
+    except OSError as exc:
+        raise ProcessError(f"Unable to inspect Codex user config: {path}") from exc
 
 
 def load_project_policy(root: Path) -> Policy:

@@ -252,6 +252,148 @@ class ControllerFlowTests(unittest.TestCase):
 
 
 class ControllerUnitTests(unittest.TestCase):
+    def test_transport_schemas_use_structured_outputs_keywords_only(self):
+        unsupported = {
+            "oneOf",
+            "allOf",
+            "if",
+            "then",
+            "minLength",
+            "maxLength",
+            "pattern",
+            "minItems",
+            "maxItems",
+            "uniqueItems",
+            "minimum",
+            "maximum",
+        }
+
+        def find_unsupported(value: object, path: str = "$.") -> list[str]:
+            found: list[str] = []
+            if isinstance(value, dict):
+                for key, child in value.items():
+                    if key in unsupported:
+                        found.append(f"{path}{key}")
+                    found.extend(find_unsupported(child, f"{path}{key}."))
+            elif isinstance(value, list):
+                for index, child in enumerate(value):
+                    found.extend(find_unsupported(child, f"{path}[{index}]."))
+            return found
+
+        worker_schema = controller.load_schema(controller.WORKER_SCHEMA_PATH)
+        reviewer_schema = controller.load_schema(controller.REVIEWER_SCHEMA_PATH)
+        self.assertIn("anyOf", json.dumps(worker_schema))
+        self.assertEqual([], find_unsupported(worker_schema))
+        self.assertEqual([], find_unsupported(reviewer_schema))
+
+    def test_worker_status_invariants_are_enforced_after_structural_validation(self):
+        gate = {
+            "type": "CUSTOM",
+            "key": "custom-key",
+            "reason": "review",
+            "proposed_action": "safe action",
+            "risk_flags": [],
+            "evidence": [],
+        }
+        invalid_payloads = [
+            {"status": "COMPLETED", "gate": gate, "failure": None},
+            {"status": "GATE_REQUIRED", "gate": None, "failure": None},
+            {"status": "FAILED", "gate": None, "failure": None},
+        ]
+        for partial in invalid_payloads:
+            with self.subTest(status=partial["status"]):
+                payload = {
+                    "status": partial["status"],
+                    "summary": "synthetic",
+                    "checks": [],
+                    "gate": partial["gate"],
+                    "failure": partial["failure"],
+                }
+                with self.assertRaises(controller.ProtocolError):
+                    controller.validate_worker_result(payload)
+
+    def test_semantic_validation_rejects_duplicate_risk_flags(self):
+        payload = {
+            "status": "GATE_REQUIRED",
+            "summary": "gate",
+            "checks": [],
+            "gate": {
+                "type": "CUSTOM",
+                "key": "custom-key",
+                "reason": "review",
+                "proposed_action": "safe action",
+                "risk_flags": ["CUSTOM_RISK", "CUSTOM_RISK"],
+                "evidence": [],
+            },
+            "failure": None,
+        }
+        with self.assertRaises(controller.ProtocolError):
+            controller.validate_worker_result(payload)
+
+        reviewer_payload = {
+            "decision": "APPROVE",
+            "reason": "safe",
+            "instructions": "",
+            "risk_flags": ["CUSTOM_RISK", "CUSTOM_RISK"],
+        }
+        with self.assertRaises(controller.ProtocolError):
+            controller.validate_reviewer_result(reviewer_payload)
+
+    def test_stderr_tail_preserves_terminal_error(self):
+        stderr = ("WARN plugin initialization\n" * 100) + "ERROR terminal Codex startup failure"
+        with self.assertRaises(controller.ProcessError) as raised:
+            controller.ensure_codex_success(
+                controller.ExecResult(("codex",), 1, "", stderr, False),
+                "Worker",
+            )
+        self.assertIn("ERROR terminal Codex startup failure", str(raised.exception))
+
+    def test_worker_and_reviewer_receive_ignore_user_config(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            config = controller.RuntimeConfig(
+                codex_command=("codex",),
+                worker_model="worker",
+                reviewer_model="reviewer",
+                worker_timeout=1,
+                reviewer_timeout=1,
+                state_home=root / "state",
+                rtk_path=None,
+            )
+            runner = controller.CodexRunner(config, root, root / "run")
+            worker_cmd = runner._base_exec("workspace-write", "worker", "high")
+            reviewer_cmd = runner._base_exec("read-only", "reviewer", "medium")
+            self.assertIn("--ignore-user-config", worker_cmd)
+            self.assertIn("--ignore-user-config", reviewer_cmd)
+
+    def test_codex_config_change_during_execution_requires_human(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            codex_home = root / "codex-home"
+            codex_home.mkdir()
+            config_path = codex_home / "config.toml"
+            config_path.write_text("before = true\n", encoding="utf-8")
+            config = controller.RuntimeConfig(
+                codex_command=("codex",),
+                worker_model="worker",
+                reviewer_model="reviewer",
+                worker_timeout=1,
+                reviewer_timeout=1,
+                state_home=root / "state",
+                rtk_path=None,
+            )
+            runner = controller.CodexRunner(config, root, root / "run")
+
+            def mutate_config(*args: object, **kwargs: object) -> controller.ExecResult:
+                config_path.write_text("after = true\n", encoding="utf-8")
+                return controller.ExecResult(("codex",), 0, "", "", False)
+
+            with mock.patch.dict(os.environ, {"CODEX_HOME": str(codex_home)}, clear=False), mock.patch.object(
+                controller, "run_process", side_effect=mutate_config
+            ):
+                with self.assertRaises(controller.HumanRequired):
+                    runner._run_codex(["codex"], "", 1, "Worker")
+
     def test_non_git_target_fails(self):
         with tempfile.TemporaryDirectory() as temp:
             base = Path(temp)

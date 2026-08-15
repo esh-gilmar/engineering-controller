@@ -1,0 +1,7 @@
+interface:
+  display_name: "Engineering Controller"
+  short_description: "Orquestra Worker e Reviewer com gates determinísticos e segurança Git."
+  default_prompt: "Use $engineering-controller apenas quando eu pedir explicitamente para executar ou retomar um Engineering Loop."
+
+policy:
+  allow_implicit_invocation: false

@@ -319,11 +319,15 @@ class CodexRunner:
         return result
 
     def _base_exec(self, sandbox: str, model: str, reasoning: str) -> list[str]:
-        return list(self.config.codex_command) + [
+        command = list(self.config.codex_command) + [
             "--ask-for-approval",
             "never",
             "--config",
             f'model_reasoning_effort="{reasoning}"',
+        ]
+        if os.name == "nt":
+            command.extend(["--config", 'windows.sandbox="elevated"'])
+        command.extend([
             "exec",
             "--ignore-user-config",
             "-C",
@@ -334,7 +338,8 @@ class CodexRunner:
             model,
             "--color",
             "never",
-        ]
+        ])
+        return command
 
 
 def utc_now() -> str:

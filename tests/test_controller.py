@@ -361,11 +361,15 @@ class ControllerUnitTests(unittest.TestCase):
                 rtk_path=None,
             )
             runner = controller.CodexRunner(config, root, root / "run")
-            worker_cmd = runner._base_exec("workspace-write", "worker", "high")
-            reviewer_cmd = runner._base_exec("read-only", "reviewer", "medium")
+            with mock.patch.object(controller.os, "name", "nt"):
+                worker_cmd = runner._base_exec("workspace-write", "worker", "high")
+                reviewer_cmd = runner._base_exec("read-only", "reviewer", "medium")
             for cmd in (worker_cmd, reviewer_cmd):
                 self.assertEqual(cmd.count("--ignore-user-config"), 1)
                 self.assertLess(cmd.index("exec"), cmd.index("--ignore-user-config"))
+                self.assertEqual(cmd.count('windows.sandbox="elevated"'), 1)
+                self.assertNotIn('windows.sandbox="unelevated"', cmd)
+                self.assertLess(cmd.index('windows.sandbox="elevated"'), cmd.index("exec"))
 
             (root / "run").mkdir()
             captured_resume: list[str] = []
@@ -388,12 +392,34 @@ class ControllerUnitTests(unittest.TestCase):
                 events = json.dumps({"type": "thread.started", "thread_id": "session-123"}) + "\n"
                 return controller.ExecResult(tuple(args), 0, events, "", False)  # type: ignore[arg-type]
 
-            with mock.patch.object(runner, "_run_codex", side_effect=fake_run):
+            with mock.patch.object(controller.os, "name", "nt"), mock.patch.object(
+                runner, "_run_codex", side_effect=fake_run
+            ):
                 runner.worker_resume("session-123", "continue safely")
 
             self.assertEqual(captured_resume.count("--ignore-user-config"), 1)
             self.assertLess(captured_resume.index("exec"), captured_resume.index("--ignore-user-config"))
             self.assertLess(captured_resume.index("--ignore-user-config"), captured_resume.index("resume"))
+            self.assertEqual(captured_resume.count('windows.sandbox="elevated"'), 1)
+            self.assertNotIn('windows.sandbox="unelevated"', captured_resume)
+
+    def test_non_windows_commands_do_not_include_windows_sandbox_override(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            config = controller.RuntimeConfig(
+                codex_command=("codex",),
+                worker_model="worker",
+                reviewer_model="reviewer",
+                worker_timeout=1,
+                reviewer_timeout=1,
+                state_home=root / "state",
+                rtk_path=None,
+            )
+            runner = controller.CodexRunner(config, root, root / "run")
+            with mock.patch.object(controller.os, "name", "posix"):
+                cmd = runner._base_exec("workspace-write", "worker", "high")
+            self.assertNotIn('windows.sandbox="elevated"', cmd)
+            self.assertNotIn('windows.sandbox="unelevated"', cmd)
 
     def test_codex_config_change_during_execution_requires_human(self):
         with tempfile.TemporaryDirectory() as temp:

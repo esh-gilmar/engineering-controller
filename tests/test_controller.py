@@ -138,6 +138,7 @@ class ControllerFlowTests(unittest.TestCase):
         self.assertIn("HUMAN_REQUIRED", result.stdout)
         self.assertEqual(self.repo.counts()["reviewer"], 0)
         self.assertEqual(self.repo.latest_state()["status"], "HUMAN_REQUIRED")
+        self.assertIn("resume disponível", result.stdout)
 
     def test_resume_after_human_required_reuses_worker_session(self):
         first = self.repo.run("human_command", "execute", "TASK.md")
@@ -185,6 +186,8 @@ class ControllerFlowTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertIn("timed out", result.stdout)
+        self.assertEqual(self.repo.latest_state()["status"], "FAILED")
+        self.assertIsNone(self.repo.latest_state().get("active_worker_pid"))
 
     def test_same_gate_loop_limit_stops_for_human(self):
         result = self.repo.run("gate_loop", "execute", "TASK.md")
@@ -226,10 +229,66 @@ class ControllerFlowTests(unittest.TestCase):
         self.assertIn("COMPLETED with failed checks", result.stdout)
 
     def test_dirty_worktree_requires_human_before_worker(self):
-        (self.repo.root / "TASK.md").write_text("dirty\n", encoding="utf-8")
+        source_dir = self.repo.root / "src"
+        source_dir.mkdir()
+        source = source_dir / "example.py"
+        source.write_text("value = 1\n", encoding="utf-8")
+        self.repo._git("add", "src/example.py")
+        self.repo._git("commit", "-m", "test: add source fixture")
+        source.write_text("value = 2\n", encoding="utf-8")
         result = self.repo.run("completed", "execute", "TASK.md")
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
-        self.assertIn("Working tree is not clean", result.stdout)
+        self.assertIn("Working tree has changes other than", result.stdout)
+        self.assertIn("src/example.py", result.stdout)
+        self.assertIn("Nenhum run resumível foi criado", result.stdout)
+        self.assertEqual(self.repo.counts()["worker"], 0)
+        self.assertFalse((self.repo.state_home / "runs").exists())
+
+    def test_untracked_prompt_is_allowed_as_only_preexisting_change(self):
+        docs = self.repo.root / "docs"
+        docs.mkdir()
+        spec = docs / "test-spec.md"
+        spec.write_text("# input spec\n", encoding="utf-8")
+        result = self.repo.run("completed", "execute", "docs/test-spec.md")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.repo.counts()["worker"], 1)
+        state = self.repo.latest_state()
+        self.assertEqual(state["status"], "COMPLETED")
+        self.assertEqual(state["prompt_path"], str(spec.resolve()))
+        self.assertNotIn("docs/test-spec.md", state["final_changed_files"])
+        self.assertEqual(state["final_changed_files"], ["result.txt"])
+
+    def test_modified_prompt_is_allowed_as_only_preexisting_change(self):
+        (self.repo.root / "TASK.md").write_text("# changed input spec\n", encoding="utf-8")
+        result = self.repo.run("completed", "execute", "TASK.md")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.repo.counts()["worker"], 1)
+        self.assertNotIn("TASK.md", self.repo.latest_state()["final_changed_files"])
+
+    def test_prompt_plus_other_dirty_file_still_blocks(self):
+        docs = self.repo.root / "docs"
+        docs.mkdir()
+        spec = docs / "test-spec.md"
+        spec.write_text("# input spec\n", encoding="utf-8")
+        source_dir = self.repo.root / "src"
+        source_dir.mkdir()
+        source = source_dir / "example.py"
+        source.write_text("value = 1\n", encoding="utf-8")
+        self.repo._git("add", "src/example.py")
+        self.repo._git("commit", "-m", "test: add source fixture")
+        source.write_text("value = 2\n", encoding="utf-8")
+        result = self.repo.run("completed", "execute", "docs/test-spec.md")
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("src/example.py", result.stdout)
+        self.assertNotIn("docs/test-spec.md,", result.stdout)
+        self.assertEqual(self.repo.counts()["worker"], 0)
+
+    def test_prompt_outside_project_target_fails_validation(self):
+        outside = self.repo.base / "outside-spec.md"
+        outside.write_text("# outside\n", encoding="utf-8")
+        result = self.repo.run("completed", "execute", str(outside))
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("Path is outside PROJECT TARGET", result.stdout)
         self.assertEqual(self.repo.counts()["worker"], 0)
 
     def test_missing_prompt_fails(self):
@@ -241,6 +300,62 @@ class ControllerFlowTests(unittest.TestCase):
         result = self.repo.run("completed", "resume")
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertIn("No saved engineering-controller run", result.stdout)
+
+    def test_stale_worker_with_saved_session_resumes_same_run(self):
+        first = self.repo.run("human_command", "execute", "TASK.md")
+        self.assertEqual(first.returncode, 2, first.stdout + first.stderr)
+        state_file = self.repo.latest_state_file()
+        state = json.loads(state_file.read_text(encoding="utf-8"))
+        run_id = state["run_id"]
+        session_id = state["worker_session_id"]
+        state["status"] = "WORKER"
+        state["active_worker_pid"] = None
+        state_file.write_text(json.dumps(state), encoding="utf-8")
+
+        resumed = self.repo.run("completed", "resume")
+        self.assertEqual(resumed.returncode, 0, resumed.stdout + resumed.stderr)
+        self.assertIn("Recovered stale WORKER", resumed.stdout)
+        final_state = self.repo.latest_state()
+        self.assertEqual(final_state["run_id"], run_id)
+        self.assertEqual(final_state["worker_session_id"], session_id)
+        self.assertEqual(final_state["status"], "COMPLETED")
+        self.assertGreaterEqual(self.repo.counts()["resume"], 1)
+
+    def test_active_worker_state_does_not_start_second_worker(self):
+        first = self.repo.run("human_command", "execute", "TASK.md")
+        self.assertEqual(first.returncode, 2, first.stdout + first.stderr)
+        state_file = self.repo.latest_state_file()
+        state = json.loads(state_file.read_text(encoding="utf-8"))
+        before_resume_count = self.repo.counts()["resume"]
+        state["status"] = "WORKER"
+        state["active_worker_pid"] = os.getpid()
+        state_file.write_text(json.dumps(state), encoding="utf-8")
+
+        resumed = self.repo.run("completed", "resume")
+        self.assertEqual(resumed.returncode, 1, resumed.stdout + resumed.stderr)
+        self.assertIn("still active", resumed.stdout)
+        self.assertIn("Do not start another Worker", resumed.stdout)
+        self.assertEqual(self.repo.counts()["resume"], before_resume_count)
+        self.assertEqual(self.repo.latest_state()["status"], "WORKER")
+
+    def test_stale_worker_without_session_fails_controlled_and_preserves_delivery(self):
+        first = self.repo.run("human_command", "execute", "TASK.md")
+        self.assertEqual(first.returncode, 2, first.stdout + first.stderr)
+        delivery = self.repo.root / "partial-delivery.txt"
+        delivery.write_text("preserve me\n", encoding="utf-8")
+        state_file = self.repo.latest_state_file()
+        state = json.loads(state_file.read_text(encoding="utf-8"))
+        state["status"] = "WORKER"
+        state["worker_session_id"] = None
+        state["active_worker_pid"] = None
+        state_file.write_text(json.dumps(state), encoding="utf-8")
+
+        resumed = self.repo.run("completed", "resume")
+        self.assertEqual(resumed.returncode, 1, resumed.stdout + resumed.stderr)
+        self.assertIn("no Worker session ID was persisted", resumed.stdout)
+        self.assertEqual(delivery.read_text(encoding="utf-8"), "preserve me\n")
+        self.assertEqual(self.repo.latest_state()["status"], "FAILED")
+        self.assertFalse(self.repo.latest_state().get("resume_available", True))
 
     def test_corrupt_state_fails_closed(self):
         first = self.repo.run("human_command", "execute", "TASK.md")
@@ -374,7 +489,13 @@ class ControllerUnitTests(unittest.TestCase):
             (root / "run").mkdir()
             captured_resume: list[str] = []
 
-            def fake_run(args: object, prompt: str, timeout: int, label: str) -> controller.ExecResult:
+            def fake_run(
+                args: object,
+                prompt: str,
+                timeout: int,
+                label: str,
+                worker_process: bool = False,
+            ) -> controller.ExecResult:
                 captured_resume.extend(args)  # type: ignore[arg-type]
                 output_path = Path(args[args.index("--output-last-message") + 1])  # type: ignore[index]
                 output_path.write_text(
@@ -448,6 +569,33 @@ class ControllerUnitTests(unittest.TestCase):
             ):
                 with self.assertRaises(controller.HumanRequired):
                     runner._run_codex(["codex"], "", 1, "Worker")
+
+    def test_prompt_hash_change_is_detected_deterministically(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            prompt = root / "TASK.md"
+            prompt.write_text("before\n", encoding="utf-8")
+            state = {
+                "branch": "main",
+                "initial_head": "abc",
+                "prompt_path": str(prompt),
+                "prompt_hash": controller.file_sha256(prompt),
+            }
+            prompt.write_text("after\n", encoding="utf-8")
+            snapshot = controller.GitSnapshot(
+                root=root,
+                branch="main",
+                head="abc",
+                changed_files=("TASK.md",),
+                diff_stat="TASK.md | 2 +-","
+            "workspace_fingerprint="synthetic",
+            )
+            with self.assertRaises(controller.HumanRequired) as raised:
+                controller.check_snapshot_invariants(snapshot, state, controller.Policy())
+            self.assertIn("prompt/SPEC changed", str(raised.exception))
+
+    def test_process_is_alive_for_current_process(self):
+        self.assertTrue(controller.process_is_alive(os.getpid()))
 
     def test_non_git_target_fails(self):
         with tempfile.TemporaryDirectory() as temp:

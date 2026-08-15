@@ -587,8 +587,8 @@ class ControllerUnitTests(unittest.TestCase):
                 branch="main",
                 head="abc",
                 changed_files=("TASK.md",),
-                diff_stat="TASK.md | 2 +-","
-            "workspace_fingerprint="synthetic",
+                diff_stat="TASK.md | 2 +-",
+                workspace_fingerprint="synthetic",
             )
             with self.assertRaises(controller.HumanRequired) as raised:
                 controller.check_snapshot_invariants(snapshot, state, controller.Policy())

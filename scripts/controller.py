@@ -320,12 +320,12 @@ class CodexRunner:
 
     def _base_exec(self, sandbox: str, model: str, reasoning: str) -> list[str]:
         return list(self.config.codex_command) + [
-            "--ignore-user-config",
             "--ask-for-approval",
             "never",
             "--config",
             f'model_reasoning_effort="{reasoning}"',
             "exec",
+            "--ignore-user-config",
             "-C",
             str(self.project_root),
             "--sandbox",

@@ -363,8 +363,37 @@ class ControllerUnitTests(unittest.TestCase):
             runner = controller.CodexRunner(config, root, root / "run")
             worker_cmd = runner._base_exec("workspace-write", "worker", "high")
             reviewer_cmd = runner._base_exec("read-only", "reviewer", "medium")
-            self.assertIn("--ignore-user-config", worker_cmd)
-            self.assertIn("--ignore-user-config", reviewer_cmd)
+            for cmd in (worker_cmd, reviewer_cmd):
+                self.assertEqual(cmd.count("--ignore-user-config"), 1)
+                self.assertLess(cmd.index("exec"), cmd.index("--ignore-user-config"))
+
+            (root / "run").mkdir()
+            captured_resume: list[str] = []
+
+            def fake_run(args: object, prompt: str, timeout: int, label: str) -> controller.ExecResult:
+                captured_resume.extend(args)  # type: ignore[arg-type]
+                output_path = Path(args[args.index("--output-last-message") + 1])  # type: ignore[index]
+                output_path.write_text(
+                    json.dumps(
+                        {
+                            "status": "COMPLETED",
+                            "summary": "resumed",
+                            "checks": [],
+                            "gate": None,
+                            "failure": None,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                events = json.dumps({"type": "thread.started", "thread_id": "session-123"}) + "\n"
+                return controller.ExecResult(tuple(args), 0, events, "", False)  # type: ignore[arg-type]
+
+            with mock.patch.object(runner, "_run_codex", side_effect=fake_run):
+                runner.worker_resume("session-123", "continue safely")
+
+            self.assertEqual(captured_resume.count("--ignore-user-config"), 1)
+            self.assertLess(captured_resume.index("exec"), captured_resume.index("--ignore-user-config"))
+            self.assertLess(captured_resume.index("--ignore-user-config"), captured_resume.index("resume"))
 
     def test_codex_config_change_during_execution_requires_human(self):
         with tempfile.TemporaryDirectory() as temp:

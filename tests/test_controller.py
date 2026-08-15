@@ -1,0 +1,323 @@
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from unittest import mock
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+SCRIPTS_DIR = REPO_ROOT / "scripts"
+CONTROLLER = SCRIPTS_DIR / "controller.py"
+FAKE_CODEX = REPO_ROOT / "tests" / "fakes" / "fake_codex.py"
+sys.path.insert(0, str(SCRIPTS_DIR))
+
+import controller  # noqa: E402
+
+
+class SyntheticRepo:
+    def __init__(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.base = Path(self.temp.name)
+        self.root = self.base / "project"
+        self.root.mkdir()
+        self.state_home = self.base / "state"
+        self.fake_state = self.base / "fake-counts.json"
+        self._git("init")
+        self._git("checkout", "-b", "main")
+        self._git("config", "user.name", "Engineering Controller Tests")
+        self._git("config", "user.email", "engineering-controller@example.invalid")
+        (self.root / "TASK.md").write_text(
+            "# Synthetic task\n\nCreate the smallest safe local result and validate it.\n",
+            encoding="utf-8",
+        )
+        self._git("add", "TASK.md")
+        self._git("commit", "-m", "test: baseline")
+
+    def close(self):
+        self.temp.cleanup()
+
+    def _git(self, *args: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["git", "-C", str(self.root), *args],
+            check=True,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+        )
+
+    def env(self, scenario: str, **extra: str) -> dict[str, str]:
+        env = os.environ.copy()
+        env.update(
+            {
+                "ENGINEERING_CONTROLLER_CODEX_CMD": json.dumps([sys.executable, str(FAKE_CODEX)]),
+                "ENGINEERING_CONTROLLER_STATE_HOME": str(self.state_home),
+                "ENGINEERING_CONTROLLER_WORKER_TIMEOUT": "5",
+                "ENGINEERING_CONTROLLER_REVIEWER_TIMEOUT": "5",
+                "EC_FAKE_SCENARIO": scenario,
+                "EC_FAKE_STATE": str(self.fake_state),
+            }
+        )
+        env.update(extra)
+        return env
+
+    def run(self, scenario: str, *args: str, env_extra: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+        env = self.env(scenario)
+        if env_extra:
+            env.update(env_extra)
+        return subprocess.run(
+            [sys.executable, str(CONTROLLER), *args],
+            cwd=str(self.root),
+            env=env,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=30,
+            check=False,
+        )
+
+    def counts(self) -> dict[str, int]:
+        if not self.fake_state.exists():
+            return {"worker": 0, "reviewer": 0, "resume": 0}
+        return json.loads(self.fake_state.read_text(encoding="utf-8"))
+
+    def latest_state_file(self) -> Path:
+        files = list((self.state_home / "runs").glob("*/*/state.json"))
+        if not files:
+            raise AssertionError("No state file found")
+        return max(files, key=lambda p: p.stat().st_mtime_ns)
+
+    def latest_state(self) -> dict:
+        return json.loads(self.latest_state_file().read_text(encoding="utf-8"))
+
+
+class ControllerFlowTests(unittest.TestCase):
+    def setUp(self):
+        self.repo = SyntheticRepo()
+
+    def tearDown(self):
+        self.repo.close()
+
+    def test_a_completed_skips_reviewer(self):
+        result = self.repo.run("completed", "execute", "TASK.md")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("[EC] COMPLETED", result.stdout)
+        self.assertTrue((self.repo.root / "result.txt").exists())
+        self.assertEqual(self.repo.counts()["reviewer"], 0)
+        self.assertEqual(self.repo.latest_state()["status"], "COMPLETED")
+
+    def test_b_gate_revise_then_completed(self):
+        result = self.repo.run("revise", "execute", "TASK.md")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("Reviewer #1: REVISE", result.stdout)
+        counts = self.repo.counts()
+        self.assertEqual(counts["reviewer"], 1)
+        self.assertEqual(counts["resume"], 1)
+        self.assertEqual(self.repo.latest_state()["worker_runs"], 2)
+
+    def test_c_gate_approve_then_completed(self):
+        result = self.repo.run("approve", "execute", "TASK.md")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("Reviewer #1: APPROVE", result.stdout)
+        counts = self.repo.counts()
+        self.assertEqual(counts["reviewer"], 1)
+        self.assertEqual(counts["resume"], 1)
+
+    def test_d_hard_guard_blocks_force_push_before_reviewer(self):
+        result = self.repo.run("human_command", "execute", "TASK.md")
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("HUMAN_REQUIRED", result.stdout)
+        self.assertEqual(self.repo.counts()["reviewer"], 0)
+        self.assertEqual(self.repo.latest_state()["status"], "HUMAN_REQUIRED")
+
+    def test_resume_after_human_required_reuses_worker_session(self):
+        first = self.repo.run("human_command", "execute", "TASK.md")
+        self.assertEqual(first.returncode, 2, first.stdout + first.stderr)
+        second = self.repo.run(
+            "completed",
+            "resume",
+            "Use",
+            "a",
+            "safe",
+            "local",
+            "alternative",
+            "only",
+        )
+        self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
+        self.assertIn("[EC] COMPLETED", second.stdout)
+        self.assertGreaterEqual(self.repo.counts()["resume"], 1)
+
+    def test_worker_invalid_json_fails_closed(self):
+        result = self.repo.run("invalid_worker_json", "execute", "TASK.md")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("FAILED", result.stdout)
+
+    def test_reviewer_invalid_json_fails_closed(self):
+        result = self.repo.run("invalid_reviewer_json", "execute", "TASK.md")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("FAILED", result.stdout)
+
+    def test_worker_nonzero_exit_fails_closed(self):
+        result = self.repo.run("worker_exit", "execute", "TASK.md")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("Worker exited with code 7", result.stdout)
+
+    def test_reviewer_nonzero_exit_fails_closed(self):
+        result = self.repo.run("reviewer_exit", "execute", "TASK.md")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("Reviewer exited with code 9", result.stdout)
+
+    def test_worker_timeout_fails_closed(self):
+        result = self.repo.run(
+            "timeout",
+            "execute",
+            "TASK.md",
+            env_extra={"ENGINEERING_CONTROLLER_WORKER_TIMEOUT": "1", "EC_FAKE_SLEEP": "3"},
+        )
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("timed out", result.stdout)
+
+    def test_same_gate_loop_limit_stops_for_human(self):
+        result = self.repo.run("gate_loop", "execute", "TASK.md")
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("Same gate exceeded automatic limit", result.stdout)
+        self.assertEqual(self.repo.counts()["reviewer"], 3)
+
+    def test_project_policy_can_reduce_loop_limit(self):
+        policy = {"max_same_gate": 1}
+        (self.repo.root / controller.PROJECT_POLICY_FILENAME).write_text(json.dumps(policy), encoding="utf-8")
+        self.repo._git("add", controller.PROJECT_POLICY_FILENAME)
+        self.repo._git("commit", "-m", "test: restrictive controller policy")
+        result = self.repo.run("gate_loop", "execute", "TASK.md")
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertEqual(self.repo.counts()["reviewer"], 1)
+
+    def test_known_secret_path_change_requires_human(self):
+        result = self.repo.run("secret_change", "execute", "TASK.md")
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("Protected path changed: .env", result.stdout)
+
+    def test_prohibited_command_event_requires_human(self):
+        result = self.repo.run("command_violation", "execute", "TASK.md")
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("prohibited command category", result.stdout)
+
+    def test_dirty_worktree_requires_human_before_worker(self):
+        (self.repo.root / "TASK.md").write_text("dirty\n", encoding="utf-8")
+        result = self.repo.run("completed", "execute", "TASK.md")
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("Working tree is not clean", result.stdout)
+        self.assertEqual(self.repo.counts()["worker"], 0)
+
+    def test_missing_prompt_fails(self):
+        result = self.repo.run("completed", "execute", "MISSING.md")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("does not exist", result.stdout)
+
+    def test_resume_without_state_fails(self):
+        result = self.repo.run("completed", "resume")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("No saved engineering-controller run", result.stdout)
+
+    def test_corrupt_state_fails_closed(self):
+        first = self.repo.run("human_command", "execute", "TASK.md")
+        self.assertEqual(first.returncode, 2, first.stdout + first.stderr)
+        self.repo.latest_state_file().write_text('{"oops": true}\n', encoding="utf-8")
+        result = self.repo.run("completed", "resume")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("Saved state is corrupt", result.stdout)
+
+
+class ControllerUnitTests(unittest.TestCase):
+    def test_non_git_target_fails(self):
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp)
+            env = os.environ.copy()
+            env.update(
+                {
+                    "ENGINEERING_CONTROLLER_CODEX_CMD": json.dumps([sys.executable, str(FAKE_CODEX)]),
+                    "ENGINEERING_CONTROLLER_STATE_HOME": str(base / "state"),
+                    "EC_FAKE_SCENARIO": "completed",
+                    "EC_FAKE_STATE": str(base / "fake.json"),
+                }
+            )
+            (base / "TASK.md").write_text("task\n", encoding="utf-8")
+            result = subprocess.run(
+                [sys.executable, str(CONTROLLER), "execute", "TASK.md"],
+                cwd=str(base),
+                env=env,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                timeout=15,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("Git command failed", result.stdout)
+
+    def test_missing_codex_is_detected(self):
+        with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(controller.shutil, "which", return_value=None):
+            with self.assertRaises(controller.ValidationError):
+                controller.discover_codex_command()
+
+    def test_rtk_is_optional(self):
+        fake_cmd = json.dumps([sys.executable, str(FAKE_CODEX)])
+        with mock.patch.dict(os.environ, {"ENGINEERING_CONTROLLER_CODEX_CMD": fake_cmd}, clear=True), mock.patch.object(
+            controller.shutil, "which", return_value=None
+        ):
+            config = controller.build_runtime_config()
+            self.assertIsNone(config.rtk_path)
+
+    def test_worker_schema_accepts_project_extension_risk_flag(self):
+        schema = controller.load_schema(controller.WORKER_SCHEMA_PATH)
+        payload = {
+            "status": "GATE_REQUIRED",
+            "summary": "gate",
+            "checks": [],
+            "gate": {
+                "type": "CUSTOM",
+                "key": "custom-key",
+                "reason": "custom",
+                "proposed_action": "safe custom action",
+                "risk_flags": ["PROJECT_CUSTOM_RISK"],
+                "evidence": [],
+            },
+            "failure": None,
+        }
+        controller.validate_json_schema(payload, schema)
+
+    def test_worker_schema_rejects_invalid_status(self):
+        schema = controller.load_schema(controller.WORKER_SCHEMA_PATH)
+        payload = {"status": "OK", "summary": "x", "checks": [], "gate": None, "failure": None}
+        with self.assertRaises(controller.ValidationError):
+            controller.validate_json_schema(payload, schema)
+
+    def test_global_forbidden_patterns_cover_core_git_guards(self):
+        forbidden = [
+            "git push --force origin main",
+            "git commit -am test",
+            "git reset --hard HEAD~1",
+            "git clean -fd",
+            "git branch -D old",
+            "git merge feature",
+            "git checkout main",
+            "git restore file.txt",
+            "codex --yolo exec task",
+        ]
+        for command in forbidden:
+            with self.subTest(command=command):
+                self.assertIsNotNone(controller.forbidden_command_reason(command, []))
+
+    def test_core_remains_project_agnostic(self):
+        text = CONTROLLER.read_text(encoding="utf-8").casefold()
+        for project_specific_term in ["zabbix", "glpi", "oracle", "senior", "sql_extractor"]:
+            with self.subTest(term=project_specific_term):
+                self.assertNotIn(project_specific_term, text)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
